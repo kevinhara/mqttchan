@@ -23,9 +23,39 @@ class DigitalClock {
 
   explicit DigitalClock(M5GFX *display) : display_(display) {}
 
-  // Starts the SNTP sync using tz (a POSIX TZ string). Safe to call before
-  // WiFi connects — the ESP32 core's SNTP client just waits for a network and
-  // syncs once one shows up.
+  // Starts the SNTP sync using tz (a POSIX TZ string).
+  //
+  // Correction, 2026-09-16: this used to say "safe to call before WiFi
+  // connects - the ESP32 core's SNTP client just waits for a network and
+  // syncs once one shows up," and main.cpp's setup() called this early on
+  // that basis. It's syntactically safe (doesn't crash or hang on its own)
+  // but not consequence-free: an intermittent
+  // "assert failed: udp_new_ip_type ... Required to lock TCPIP core
+  // functionality!" crash during MQTT's hostname DNS lookup was traced (via
+  // xtensa-esp32-elf-addr2line against a live crash) to SNTP's own pending
+  // DNS retry for its NTP server firing reentrantly, mid-lookup, off the
+  // *other* DNS lookup MQTT's PubSubClient::connect() does for its hostname
+  // - lwIP's DNS cache management can invoke a pending callback (here,
+  // SNTP's) as a side effect of resolving an unrelated name, and that
+  // nested call lands outside the locking the outer call expected. This
+  // only happens if an earlier SNTP attempt is still pending/retrying when
+  // that second DNS lookup runs - which an early, pre-WiFi begin() call all
+  // but guarantees, since that first attempt has nothing to resolve against
+  // yet. main.cpp's setup() no longer calls this before WiFi is up; the
+  // first real call now happens in appTask, after MQTT is connected. The
+  // old comment was believable because "safe" was true in the narrow sense
+  // of "won't itself crash" - it just didn't account for what calling it
+  // early does to code elsewhere that also does DNS.
+  //
+  // Verified live 2026-09-16: the crash reproduced 1 time out of 3
+  // DTR/RTS-reset trials right after this fix was written (before the
+  // ordering fix below was in place, i.e. the baseline), consistent with
+  // the ~2/7 rate seen earlier the same session. After moving the first
+  // real call to appTask (main.cpp, after mqttLink.begin() rather than
+  // before WiFi is even up), 0 crashes across 16 trials in two back-to-back
+  // batches, 15/16 reaching "MQTT: connected" cleanly (1 inconclusive,
+  // timed out waiting rather than crashing). Not a mathematical proof for
+  // an intermittent bug, but a strong result against that baseline.
   void begin(const String &tz = kDefaultTz) { setTimezone(tz); }
 
   // (Re)applies a POSIX TZ string, e.g. after a BLE config write changes it —

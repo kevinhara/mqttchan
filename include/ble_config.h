@@ -48,6 +48,12 @@ class BleConfigService {
 
     NimBLEDevice::init(deviceName);
     NimBLEServer *server = NimBLEDevice::createServer();
+    // m_advertiseOnDisconnect defaults to false, so without this the device
+    // only ever advertises once at boot: after a client disconnects (e.g.
+    // the browser tab closing or hitting Disconnect), NimBLE never resumes
+    // advertising and the device becomes permanently invisible to a second
+    // requestDevice() scan until the next reboot.
+    server->advertiseOnDisconnect(true);
     NimBLEService *service = server->createService(kServiceUuid);
 
     configChar_ = service->createCharacteristic(

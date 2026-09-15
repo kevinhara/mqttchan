@@ -10,6 +10,8 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Avatar.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <string.h>
 #include <deque>
 #include <utility>
@@ -62,6 +64,11 @@ class MqttLink {
   // write) and drops both links so the next loop() call reconnects with
   // them — loop() already does connect-if-down, so this just needs to make
   // "down" true. Doesn't block: appTask's next ~50ms tick does the work.
+  // Callable only from appTask's own thread: it touches WiFi.disconnect()/
+  // mqtt_.disconnect() (lwIP) and the ssid_/pass_/host_/port_/topic_ fields
+  // connectWiFi()/connectMqtt() read, same as loop() itself - see main.cpp's
+  // bleConfigDirty flag, which is how a NimBLE-thread BLE config write gets
+  // this called on appTask instead of directly on NimBLE's host task.
   void reconfigure(const String &ssid, const String &pass, const String &host,
                     uint16_t port, const String &topic) {
     ssid_ = ssid;
@@ -96,22 +103,31 @@ class MqttLink {
     }
     mqtt_.loop();
     drainQueue();
-    if (queue_.empty()) return;
-    PendingMessage msg = std::move(queue_.front());
-    queue_.pop_front();
-    display(msg, queue_.size());
+    PendingMessage msg;
+    size_t remaining;
+    if (!popQueued(&msg, &remaining)) return;
+    display(msg, remaining);
   }
 
   // Headless bench test (see AVATAR_FB_DUMP in main.cpp): exercises the
   // parse-and-display path with a synthetic payload, no live broker needed.
+  // Only ever called from appTask before the loop() above starts running
+  // (see main.cpp), so there is no other task to race with — safe to
+  // display immediately rather than going through the queue.
   void injectForTest(const char *json) {
     handleMessage(reinterpret_cast<const uint8_t *>(json), strlen(json));
   }
 
-  // Same path, explicit length — used by BleConfigService's test-message
-  // characteristic, whose BLE-delivered payload isn't a C string literal.
+  // Used by BleConfigService's test-message characteristic. That write
+  // callback runs on the NimBLE host task, not appTask - a different thread
+  // from the one loop() above runs on. display() is not safe to call from
+  // two threads at once (it drives the shared, non-reentrant oledText
+  // display/I2C bus that idleClock->tick() also draws to from appTask every
+  // ~50ms), so this must not call display() directly the way it used to.
+  // Enqueuing instead means the message waits its turn and is always shown
+  // from loop() on appTask, same as an MQTT message - see enqueue().
   void injectMessage(const uint8_t *payload, size_t length) {
-    handleMessage(payload, length);
+    enqueue(payload, length);
   }
 
   // Updates how a finished message behaves on the bubble panel: holdMs is how
@@ -126,9 +142,50 @@ class MqttLink {
     keepLastMessage_ = keepLastMessage;
   }
 
+  // True once display() has left a message up under keepLastMessage_ instead
+  // of reverting to the idle clock. main.cpp's loop must skip idleClock->tick()
+  // while this holds - tick() redraws the same oledText panel the bubble used,
+  // so an untouched idle clock would otherwise overwrite the "kept" message
+  // the moment the wall-clock second changes, undoing keepLastMessage_ within
+  // about a second of it finishing typing.
+  bool isHoldingMessage() const { return messageHeld_; }
+
+  // One-off "what am I connected to" message, shown right after begin()'s
+  // connect attempts settle so a glance at the bubble confirms the broker,
+  // link state, network identity and BLE identity without needing a laptop.
+  // Always holds for a fixed 10s regardless of setDisplayOptions()'s
+  // holdMs_/keepLastMessage_ - those govern real MQTT messages, not this one
+  // - then reverts to the idle clock the same way display() does. Only safe
+  // to call before loop() starts pulling from the queue (same constraint as
+  // injectForTest()/handleMessage() - see there), which is how main.cpp uses
+  // it.
+  //
+  // bleName/bleAddress are handed in rather than read from a BLE object this
+  // class doesn't own - main.cpp calls this after BleConfigService::begin(),
+  // passing the same device name it advertised and NimBLEDevice::getAddress()
+  // (see main.cpp's appTask). WiFi's hostname is set here, in connectWiFi(),
+  // rather than read back from anywhere else, since kHostname is this
+  // class's own constant either way.
+  void showStartupInfo(const String &bleName, const String &bleAddress) {
+    if (bubble_ == nullptr) return;
+    String text = String("MQTT ") + host_ + ":" + port_ + " - " +
+                  (mqtt_.connected() ? "online" : "offline") + " | " +
+                  kHostname + " " + WiFi.localIP().toString() + " | BLE " +
+                  bleName + " " + bleAddress;
+    bubble_->show(text.c_str());
+    bubble_->holdWithCountdown(10000);
+    if (clock_ != nullptr) clock_->showNow();
+  }
+
  private:
   static MqttLink *self_;
   static constexpr const char *kClientId = "avatar-demo";
+  // Advertised to the router/DHCP and shown on the startup screen above, so
+  // the device is identifiable in a DHCP lease list or `ping` without first
+  // opening BLE. Set in connectWiFi(), ahead of WiFi.begin() - ESP32's
+  // WiFi.setHostname() only takes effect if called before the connection is
+  // established.
+  static constexpr const char *kHostname = "mqttchan";
   // First-boot default for holdMs_ below - see DeviceSettings::load().
   static constexpr uint32_t kDefaultMessageHoldMs = 30000;
 
@@ -136,6 +193,7 @@ class MqttLink {
     if (WiFi.status() == WL_CONNECTED) return;
     Serial.println("WiFi: connecting...");
     WiFi.mode(WIFI_STA);
+    WiFi.setHostname(kHostname);  // must precede begin() to take effect
     WiFi.begin(ssid_, pass_);
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
@@ -190,24 +248,55 @@ class MqttLink {
     return true;
   }
 
-  // Called from PubSubClient's callback (onMessage above). Deliberately just
-  // parses and pushes - it must return fast so mqtt_.loop() gets back to
-  // servicing the socket instead of blocking on display() below, which is
-  // what lets drainQueue() build up a real backlog to count and display one
-  // at a time instead of only ever seeing the single most recent message.
+  // Pushes a parsed message onto queue_ for loop() (appTask) to pick up and
+  // display. Called from two different threads - PubSubClient's callback
+  // (onMessage above), which runs inside mqtt_.loop() on appTask, and
+  // injectMessage(), which runs on the NimBLE host task when a BLE client
+  // writes the test-message characteristic - so queue_ access is guarded by
+  // queueMutex_ rather than assuming a single caller thread. Deliberately
+  // just parses and pushes rather than displaying inline - it must return
+  // fast so mqtt_.loop() gets back to servicing the socket instead of
+  // blocking on display(), which is what lets drainQueue() build up a real
+  // backlog to count and display one at a time instead of only ever seeing
+  // the single most recent message.
   void enqueue(const uint8_t *payload, unsigned int length) {
     PendingMessage msg;
     if (!parseMessage(payload, length, &msg)) return;
+    xSemaphoreTake(queueMutex_, portMAX_DELAY);
     queue_.push_back(std::move(msg));
+    xSemaphoreGive(queueMutex_);
   }
 
-  // Used by injectMessage/injectForTest, which are synchronous "show this
-  // now" bench/BLE hooks rather than live MQTT traffic - they bypass the
-  // queue and display immediately.
+  // Used only by injectForTest, which runs during setup on appTask before
+  // loop() below starts, so there's no other thread it can race with -
+  // display() is safe to call inline here. Do not reuse this for anything
+  // that might be called from another thread (e.g. a BLE callback) - see
+  // injectMessage()/enqueue() for why that must go through the queue.
   void handleMessage(const uint8_t *payload, unsigned int length) {
     PendingMessage msg;
     if (!parseMessage(payload, length, &msg)) return;
-    display(msg, queue_.size());
+    display(msg, queuedCount());
+  }
+
+  size_t queuedCount() {
+    xSemaphoreTake(queueMutex_, portMAX_DELAY);
+    size_t n = queue_.size();
+    xSemaphoreGive(queueMutex_);
+    return n;
+  }
+
+  // Pops the next message for loop() to display, or returns false if queue_
+  // is empty. Guarded the same as enqueue() - see there for why.
+  bool popQueued(PendingMessage *out, size_t *remaining) {
+    xSemaphoreTake(queueMutex_, portMAX_DELAY);
+    bool has = !queue_.empty();
+    if (has) {
+      *out = std::move(queue_.front());
+      queue_.pop_front();
+      *remaining = queue_.size();
+    }
+    xSemaphoreGive(queueMutex_);
+    return has;
   }
 
   // mqtt_.loop() (called just before this in loop()) only reads one packet
@@ -215,15 +304,15 @@ class MqttLink {
   // message (typing + kMessageHoldMs) - tens of seconds. Whatever the broker
   // sends during that time just accumulates in the OS socket buffer, unread.
   // Draining right before picking the next message to show catches up on
-  // that backlog as fast as enqueue() can absorb it, so queue_.size() below
+  // that backlog as fast as enqueue() can absorb it, so queuedCount() below
   // reflects an actual count instead of always being 0 or 1. Capped so a
   // sustained flood can't stall WiFi/BLE servicing indefinitely.
   void drainQueue() {
     static constexpr size_t kMaxDrainIterations = 32;
     for (size_t i = 0; i < kMaxDrainIterations && mqtt_.connected(); i++) {
-      size_t before = queue_.size();
+      size_t before = queuedCount();
       mqtt_.loop();
-      if (queue_.size() == before) break;
+      if (queuedCount() == before) break;
     }
   }
 
@@ -247,6 +336,10 @@ class MqttLink {
     }
 
     avatar_->setExpression(expr);
+    // A new message is about to take over the panel, so any previously held
+    // message is no longer what's on screen - reset before the keepLastMessage_
+    // branch below decides whether this one ends up held too.
+    messageHeld_ = false;
     if (bubble_ != nullptr && msg.text.length() > 0) {
       lipSyncActive_ = true;
       xTaskCreatePinnedToCore(lipSyncTask, "lipSync", 2048, this, 1, nullptr,
@@ -259,7 +352,10 @@ class MqttLink {
         // Configured to leave the last message up indefinitely (see
         // setDisplayOptions()) - skip the hold/countdown and the revert to
         // the idle clock below; the face and bubble stay exactly as set
-        // until the next message arrives.
+        // until the next message arrives. messageHeld_ tells main.cpp's loop
+        // to stop calling idleClock->tick(), which would otherwise draw over
+        // this same panel the moment the wall-clock second changes.
+        messageHeld_ = true;
         return;
       }
 
@@ -295,11 +391,19 @@ class MqttLink {
   // Set by setDisplayOptions(), read by display() - see there for behavior.
   uint32_t holdMs_ = kDefaultMessageHoldMs;
   bool keepLastMessage_ = false;
+  // Set by display() when keepLastMessage_ leaves a message up instead of
+  // reverting to the idle clock; read by isHoldingMessage(). See there.
+  bool messageHeld_ = false;
 
-  // Messages received over MQTT but not yet displayed - see enqueue() and
-  // drainQueue(). Not touched by injectMessage/injectForTest, which display
-  // straight away.
+  // Messages waiting to be displayed - pushed by enqueue() (from either the
+  // MQTT callback on appTask or a BLE test-message write on the NimBLE host
+  // task) and popped by loop() on appTask - see popQueued(). Not touched by
+  // injectForTest, which displays straight away (see handleMessage()).
   std::deque<PendingMessage> queue_;
+  // Guards queue_ since enqueue()/popQueued()/queuedCount() can be called
+  // from two different FreeRTOS tasks (appTask and the NimBLE host task) -
+  // see enqueue()'s comment.
+  SemaphoreHandle_t queueMutex_ = xSemaphoreCreateMutex();
 
   m5avatar::Avatar *avatar_;
   SpeechBubble *bubble_;

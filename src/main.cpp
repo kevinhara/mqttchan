@@ -19,6 +19,8 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <Avatar.h>
+#include <U8g2lib.h>
+#include <Wire.h>
 
 #include "ssd1306_display.h"
 #include "small_oled_face.h"
@@ -28,6 +30,8 @@
 #include "device_settings.h"
 #include "ble_config.h"
 #include "secrets.h"
+#include "boot.h"
+#include "splash.h"
 
 // SSD1306 on SDA=GPIO4, SCL=GPIO15, address 0x3C.
 // SDA is on GPIO4 rather than the more usual GPIO2 because GPIO2 is a
@@ -57,9 +61,65 @@
 // boot-strapping pins (0/2/5/12), and the flash pins (6-11).
 #define PIEZO_PIN 27
 
-static SSD1306Display oled(OLED_SDA, OLED_SCL);
-static SSD1306Display oledText(OLED_TEXT_SDA, OLED_TEXT_SCL, 400000,
-                                OLED_TEXT_I2C_PORT, 0x3C);
+// Swapped 2026-09-15: the two physical OLED panels turned out to be mounted
+// reversed relative to their wiring, so `oled` (the avatar/face panel) and
+// `oledText` (bubble+clock) now each take the *other's* former pins/bus to
+// put content back on the correct physical screen. GPIO4/15's hardware bus
+// and GPIO32/33's bit-banged bus are unchanged as electrical facts (see the
+// macro comments above) — only which content rides which bus moved. Net
+// effect: the avatar now runs on the slower 400kHz bit-banged bus instead of
+// the 800kHz hardware one, until the wiring itself gets corrected instead.
+static SSD1306Display oled(OLED_TEXT_SDA, OLED_TEXT_SCL, 400000,
+                            OLED_TEXT_I2C_PORT, 0x3C);
+static SSD1306Display oledText(OLED_SDA, OLED_SCL);
+
+// HLI boot POST + splash intro (boot.h/splash.h, ported verbatim from
+// ~/Code/esp32_oled/HLI): drawn through U8g2's own I2C drivers, not through
+// the LGFX `oled`/`oledText` objects above, since boot.cpp/splash.cpp draw
+// directly to a U8G2& and porting them to LGFX wasn't worth it for a
+// sequence that only plays once, before each panel gets handed to its real
+// owner (the avatar / the clock+bubble). Named for physical position rather
+// than content below, since which sequence draws where has already flipped
+// once (2026-09-16: POST moved to the top panel, splash to the bottom one —
+// see setup()).
+//
+// Correction, 2026-09-15: this used to say the two sequences "run on
+// separate panels concurrently rather than one after another" — setup()
+// drew both every frame in one shared while loop. That turned out to be why
+// *both* were reported janky, not just the slower of the two: sharing one
+// frame clock meant each sequence's own animation was throttled down to
+// whatever pace the loop as a whole could sustain, which was however long
+// the slower panel's send took, regardless of how fast the other one's own
+// bus was. setup() below now runs them as two genuinely separate phases —
+// POST alone first, then splash alone — so each phase's frame rate is
+// bounded only by its own panel.
+//
+// U8G2_R0 on both, not U8G2_R2::R2 (180°) looked upside down on real
+// hardware even though it matches M5.Display's/oledText's own
+// setRotation(2) below — U8g2's rotation and LGFX's rotation(2) don't agree
+// for this SSD1306 driver/panel combination. Verified live 2026-09-15.
+//
+// Pins/bus swapped 2026-09-15 along with `oled`/`oledText` above, for the
+// same physical-panel reversal — u8g2Top must stay on whichever pins `oled`
+// now uses (both drive the physically-top panel, one at boot and one at
+// runtime), same for u8g2Bottom/oledText. That puts u8g2Top (POST) on
+// GPIO32/33 and u8g2Bottom (splash) on GPIO4/15.
+//
+// u8g2Top claims the ESP32's second hardware I2C peripheral (Wire1) for
+// GPIO32/33 instead of U8g2's own software/bit-banged I2C, even though that
+// pair has no pre-existing hardware claim the way GPIO4/15 does — Wire1
+// sits completely idle for the whole length of this phase regardless, and
+// U8g2's software I2C bit-bangs through digitalWrite() per bit, which
+// measured slow enough (tens of ms to send one 1024-byte frame) to be the
+// actual cause of POST's own reported jank, on top of the shared-loop
+// problem above. See Wire1.begin() in setup() and platformio.ini's
+// U8X8_HAVE_2ND_HW_I2C flag — without it the _2ND_HW_I2C constructor below
+// is a silent no-op. u8g2Bottom needs no equivalent treatment: it already
+// sits on GPIO4/15's actual hardware peripheral (global Wire/I2C_NUM_0).
+static U8G2_SSD1306_128X64_NONAME_F_2ND_HW_I2C u8g2Top(U8G2_R0,
+                                                        U8X8_PIN_NONE);
+static U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2Bottom(U8G2_R0, U8X8_PIN_NONE,
+                                                       OLED_SCL, OLED_SDA);
 static m5avatar::Avatar avatar;
 static SpeechBubble *bubble = nullptr;
 // The bubble panel's idle/default face — MqttLink switches back to this once
@@ -205,17 +265,33 @@ static void appTask(void *) {
   // BLE config: a phone (nRF Connect, LightBlue, ...) can connect, read/write
   // WiFi+MQTT+display settings, and push a one-off test message through the
   // same {"text":...,"expression":...} JSON path MQTT uses — see
-  // ble_config.h.
+  // ble_config.h. Started ahead of showStartupInfo() below (moved up from
+  // after it) so that screen can report the BLE identity NimBLEDevice::init()
+  // assigns, alongside the WiFi one, instead of just the MQTT one.
+  //
+  // onConfig_ below runs on NimBLE's own host task, not appTask (see
+  // ble_config.h's file-header comment). mqttLink.reconfigure() touches
+  // WiFi.disconnect()/mqtt_.disconnect() and idleClock->setTimezone() touches
+  // configTzTime()/SNTP - both ultimately reach into lwIP, which is the same
+  // subsystem appTask's own connectWiFi()/connectMqtt() (called from
+  // mqttLink.loop() below) are using at essentially the same time. Calling
+  // them directly from the BLE thread races appTask's WiFi/MQTT connect calls
+  // on that shared lwIP state with no serialization between the two threads -
+  // exactly the class of bug behind an intermittent
+  // "assert failed: udp_new_ip_type ... Required to lock TCPIP core
+  // functionality!" crash seen during testing. Rather than call any of that
+  // here, just record that settings changed; bleConfigDirty is only ever set
+  // here and only ever read/cleared in appTask's for(;;) loop below, so the
+  // actual WiFi/MQTT/SNTP work stays entirely on appTask's own thread, same
+  // as every other path that touches it.
+  static volatile bool bleConfigDirty = false;
   static BleConfigService bleConfig;
+  static constexpr const char *kBleDeviceName = "MqttChan-Config";
   bleConfig.begin(
-      "MqttChan-Config",
+      kBleDeviceName,
       [](const JsonDocument &doc) {
         settings.applyAndSave(doc);
-        mqttLink.reconfigure(settings.ssid, settings.pass, settings.host,
-                              settings.port, settings.topic);
-        mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
-                                    settings.keepLastMessage);
-        if (idleClock != nullptr) idleClock->setTimezone(settings.tz);
+        bleConfigDirty = true;
         Serial.println("BLE: settings updated, reconnecting");
       },
       [](const uint8_t *data, size_t len) {
@@ -232,6 +308,15 @@ static void appTask(void *) {
         doc["keepLast"] = settings.keepLastMessage;
       });
 
+  // First thing on the bubble panel: host/port + online status, hostname/IP,
+  // and BLE name/address, so a glance confirms everything this device is
+  // reachable through without needing a laptop. Fixed 10s hold, independent
+  // of settings.messageHoldSeconds - see showStartupInfo(). Safe to call
+  // here, ahead of the appTask loop below that starts servicing the message
+  // queue.
+  mqttLink.showStartupInfo(kBleDeviceName,
+                            NimBLEDevice::getAddress().toString().c_str());
+
 #ifdef AVATAR_FB_DUMP
   // Headless bench test: exercise the parse-and-display path with a
   // synthetic payload, no live broker required — same "read back what was
@@ -244,11 +329,30 @@ static void appTask(void *) {
 
   uint32_t lastStatusPush = 0;
   for (;;) {
+    // Apply a pending BLE config write here, on appTask's own thread, before
+    // touching WiFi/MQTT below - see the comment above bleConfig.begin() for
+    // why this can't happen directly on the BLE callback's thread.
+    if (bleConfigDirty) {
+      bleConfigDirty = false;
+      mqttLink.reconfigure(settings.ssid, settings.pass, settings.host,
+                            settings.port, settings.topic);
+      mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
+                                  settings.keepLastMessage);
+      if (idleClock != nullptr) idleClock->setTimezone(settings.tz);
+    }
     mqttLink.loop();
-    // handleMessage() runs synchronously inside mqttLink.loop() above, so
-    // this never races a message reveal for the oledText panel — by the
-    // time control gets here the bubble is either idle or just went idle.
-    if (idleClock != nullptr) idleClock->tick();
+    // display() only ever runs synchronously inside mqttLink.loop() above,
+    // on this same appTask thread — MQTT messages and BLE test messages
+    // (BleConfigService's test-message write lands on the NimBLE host task,
+    // a different thread, but injectMessage() queues rather than displaying
+    // straight away; see mqtt_link.h's enqueue()/popQueued()) both funnel
+    // through here. So this never races a message reveal for the oledText
+    // panel — by the time control gets here the bubble is either idle or
+    // just went idle. Skipped while isHoldingMessage() - both draw to the
+    // same oledText panel, so an untouched tick() would redraw the clock over
+    // a keepLastMessage_ message the moment the wall-clock second changes,
+    // undoing it within about a second of it finishing typing.
+    if (idleClock != nullptr && !mqttLink.isHoldingMessage()) idleClock->tick();
     // Refresh the BLE status characteristic every couple seconds rather than
     // every 50ms tick - it's read-on-demand by the client, not notified.
     uint32_t now = millis();
@@ -265,6 +369,100 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // Needed ahead of the POST beep below; everything else that used to set
+  // this pin up happens later, alongside the real `oledText` panel init.
+  pinMode(PIEZO_PIN, OUTPUT);
+
+  // HLI boot POST + splash intro, played once before M5Unified/LGFX claims
+  // either panel — POST (scrolling console text) first, alone, then splash
+  // (the flashy full-frame graphic) alone once POST is done. (Swapped
+  // 2026-09-16 from the original splash-on-top/POST-on-bottom pairing —
+  // panel choice turned out to be a taste call either way, not something the
+  // hand-off below depends on.)
+  //
+  // Correction, 2026-09-15: this used to run both sequences concurrently, in
+  // one shared while loop — see the correction above u8g2Top/u8g2Bottom's
+  // declarations for why that made both of them look janky, not just the
+  // slower panel. The two phases below are now fully separate: whichever
+  // panel isn't currently playing is blanked and left alone rather than
+  // drawn to every frame for no reason.
+  //
+  // Since the 2026-09-15 physical-panel-reversal pin swap (see the comment
+  // above `oled`/`oledText`'s declarations), u8g2Top (POST) is the one on
+  // GPIO32/33 and u8g2Bottom (splash) is the one on GPIO4/15 — the opposite
+  // of how this used to read. u8g2Top claims Wire1 (I2C_NUM_1) for its
+  // phase instead of bit-banging (see the comment above its declaration);
+  // u8g2Bottom uses the global Wire (I2C_NUM_0) it always has. Both get
+  // released below, before M5.begin(), so the panels' real runtime owners
+  // start from a clean bus: Wire.end() for oledText (GPIO4/15, LGFX
+  // hardware I2C_NUM_1 — a different peripheral number, but released the
+  // same way as good hygiene) and Wire1.end() for oled (GPIO32/33, LGFX's
+  // own bit-banged path — this one matters, since a hardware peripheral
+  // left attached to those pins would otherwise still be driving them
+  // alongside oled's plain digitalWrite() bit-banging).
+  Wire1.begin(OLED_TEXT_SDA, OLED_TEXT_SCL, 400000);
+  u8g2Top.setBusClock(400000);  // must precede begin()
+  u8g2Top.begin();
+  u8g2Top.setContrast(255);
+  u8g2Bottom.setBusClock(400000);
+  u8g2Bottom.begin();
+  u8g2Bottom.setContrast(255);
+
+  // Beat to hold on each phase's settled last frame before handing off, so
+  // POST's cursor and splash's landed title card are actually seen rather
+  // than the app cutting away the instant each script ends.
+  constexpr uint32_t PHASE_HOLD_MS = 2000;
+
+  // Phase 1: POST alone, on u8g2Top. u8g2Bottom is blanked up front rather
+  // than left showing whatever garbage the SSD1306 powered on with.
+  u8g2Bottom.clearBuffer();
+  u8g2Bottom.sendBuffer();
+  boot::begin();
+  bool bootDone = false;
+  uint32_t bootDoneAt = 0;
+  for (;;) {
+    boot::draw(u8g2Top);
+    // The single "POST passed" beep a DOS-era BIOS gives right as its self
+    // test hands off to the bootloader.
+    if (!bootDone && boot::done()) {
+      tone(PIEZO_PIN, 1000, 150);
+      bootDone = true;
+      bootDoneAt = millis();
+    }
+    if (bootDone && millis() - bootDoneAt >= PHASE_HOLD_MS) break;
+    delay(16);
+  }
+
+  // Hand off: blank u8g2Top before splash claims the other panel, so POST's
+  // frozen last frame isn't still sitting there through the whole next phase.
+  u8g2Top.clearBuffer();
+  u8g2Top.sendBuffer();
+
+  // Phase 2: splash alone, on u8g2Bottom, with its synthwave riff on the
+  // piezo (splash::playTheme() — see splash.cpp for the "retro cassette"
+  // arpeggio this plays). Stops at the end of its one-shot intro plus the
+  // same hold beat; the attract loop (kicker lines cycling, scan bar
+  // sweeping) never gets to run here; there's nothing left to attract
+  // anyone to before the app boots into real mode.
+  splash::begin();
+  bool splashDone = false;
+  uint32_t splashDoneAt = 0;
+  for (;;) {
+    splash::draw(u8g2Bottom);
+    splash::playTheme(PIEZO_PIN);
+    if (!splashDone && !splash::intro()) {
+      splashDone = true;
+      splashDoneAt = millis();
+    }
+    if (splashDone && millis() - splashDoneAt >= PHASE_HOLD_MS) break;
+    delay(16);
+  }
+  u8g2Bottom.clearBuffer();
+  u8g2Bottom.sendBuffer();
+
+  Wire.end();
+  Wire1.end();
+
   auto cfg = M5.config();
   // Nothing else is on this board, so skip the probes. external_display_value
   // in particular defaults to 0xFFFF, which scans PortA I2C for M5 display
@@ -277,12 +475,16 @@ void setup() {
   M5.begin(cfg);
 
   // Order matters: M5.begin() runs M5GFX board autodetect, which probes SPI
-  // pins (GPIO15 among them, which is our SCL) looking for M5Stack panels.
-  // Initialising the OLED afterwards re-owns those pins and sends the SSD1306
-  // its full reset sequence, so whatever autodetect left behind is discarded.
-  // Doing it in the other order leaves the panel blank.
+  // pins (GPIO15 among them) looking for M5Stack panels. Initialising a panel
+  // afterwards re-owns whatever pins it uses and sends the SSD1306 its full
+  // reset sequence, so whatever autodetect left behind is discarded. Doing it
+  // in the other order leaves the panel blank. Since the 2026-09-15 pin swap
+  // above, GPIO15 is oledText's SCL, not oled's (oled is now on GPIO33,
+  // which autodetect doesn't probe) — the concern this comment describes now
+  // applies to oledText.init() below, not this call, but both already run
+  // after M5.begin() so the ordering requirement is satisfied either way.
   if (!oled.init()) {
-    Serial.println("SSD1306 init failed - check wiring on SDA=4 SCL=15 @0x3C");
+    Serial.println("SSD1306 init failed - check wiring on SDA=32 SCL=33 @0x3C");
     while (true) delay(1000);
   }
 
@@ -299,20 +501,25 @@ void setup() {
   // Second panel: the speech bubble. Not made primary, so the avatar never
   // touches it — accessed only through `bubble` below. If it's missing or at
   // the wrong address this just logs and carries on without it; the avatar
-  // half of the demo doesn't depend on it.
-  pinMode(PIEZO_PIN, OUTPUT);
-
+  // half of the demo doesn't depend on it. (PIEZO_PIN's pinMode() already
+  // happened at the top of setup(), ahead of the boot-POST beep.)
   if (oledText.init()) {
     M5.addDisplay(oledText);
     oledText.setRotation(2);
     bubble = new SpeechBubble(&oledText, beepChar);
     idleClock = new DigitalClock(&oledText);
-    idleClock->begin();
+    // Not idleClock->begin() here - see digital_clock.h's begin() comment
+    // for why starting SNTP this early (well before WiFi.begin() ever runs)
+    // is implicated in the intermittent MQTT-connect lwIP crash. showNow()
+    // alone still draws the correct "--:--" unsynced placeholder (draw()'s
+    // tm_year check treats "never configured" the same as "not synced yet").
+    // appTask's real idleClock->setTimezone() call, after WiFi/MQTT connect,
+    // is what actually starts SNTP now.
     idleClock->showNow();
   } else {
     Serial.println(
-        "Second SSD1306 (text) init failed - check wiring on SDA=32 "
-        "SCL=33 @0x3C");
+        "Second SSD1306 (text) init failed - check wiring on SDA=4 "
+        "SCL=15 @0x3C");
   }
 
   avatar.setFace(new m5avatar::SmallOledFace());

@@ -40,8 +40,39 @@ class SpeechBubble {
     display_->fillScreen(TFT_BLACK);
     display_->drawRoundRect(0, 0, display_->width(), display_->height(), 6,
                              TFT_WHITE);
+
+    // Lines beyond what fits inside the border scroll the content area
+    // upward one row at a time instead of typing off the bottom of the
+    // screen unseen — see scrollRect below for why this only affects text,
+    // not the border. maxLines is rounded down, so kLineHeight always
+    // divides the scroll region evenly and a scroll never leaves a sliver
+    // of the previous line's pixels behind.
+    const int maxLines = (display_->height() - 2 * kMargin) / kLineHeight;
+    const int scrollHeight = maxLines * kLineHeight;
+    // setScrollRect only affects scroll() below, not normal drawing/clipping,
+    // so this can be set once up front without touching fillScreen/
+    // drawRoundRect above or the per-character prints below.
+    display_->setScrollRect(kMargin, kMargin,
+                             display_->width() - 2 * kMargin, scrollHeight);
+
     int cursorY = kMargin;
-    for (const auto &line : wrapLines(text)) {
+    std::vector<String> lines = wrapLines(text);
+    for (size_t lineIndex = 0; lineIndex < lines.size(); lineIndex++) {
+      if (lineIndex > 0) {
+        if (static_cast<int>(lineIndex) < maxLines) {
+          cursorY += kLineHeight;
+        } else {
+          // Screen's full: shift everything already shown up by one row
+          // rather than growing cursorY past the border. scroll() runs its
+          // own nested startWrite()/endWrite(), which — same as the
+          // per-character prints below — won't auto-flush to the physical
+          // OLED while show()'s outer transaction is still open, hence the
+          // explicit display() call.
+          display_->scroll(0, -kLineHeight);
+          display_->display();
+        }
+      }
+      const String &line = lines[lineIndex];
       display_->setCursor(kMargin, cursorY);
       for (size_t i = 0; i < line.length(); i++) {
         display_->print(line[i]);
@@ -57,7 +88,6 @@ class SpeechBubble {
         if (onChar_ && line[i] != ' ') onChar_();
         vTaskDelay(pdMS_TO_TICKS(charDelayMs));
       }
-      cursorY += kLineHeight;
     }
     display_->endWrite();
   }

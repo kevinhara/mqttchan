@@ -50,31 +50,44 @@ Two SSD1306 panels, **each on its own I2C bus** — they don't share pins:
 
 | Panel | SDA | SCL | VCC | GND | Bus |
 |---|---|---|---|---|---|
-| Face (`oled`) | GPIO4 | GPIO15 | 3V3 | GND | hardware I2C port 1 |
-| Bubble (`oledText`) | GPIO32 | GPIO33 | 3V3 | GND | software (bit-banged) I2C |
+| Face (`oled`) | GPIO32 | GPIO33 | 3V3 | GND | software (bit-banged) I2C |
+| Bubble (`oledText`) | GPIO4 | GPIO15 | 3V3 | GND | hardware I2C port 1 |
 
 Both panels answer at the default address **0x3C** — no jumper needed, since
 they're on physically separate buses and there's nothing to collide with.
 
-**Do not move the face panel's SDA to GPIO2.** GPIO2 is a boot-strapping pin;
-the OLED's pull-up on it holds the ESP32 out of USB download mode (`Wrong boot
-mode detected (0x1b)`) and flashing fails whenever the display is attached.
-Same lesson the sibling `hello-world` panel learned on 2026-09-14. Port 1 is
-likewise deliberate for the face panel: M5Unified's `begin()` claims port 0 for
-its own PortA devices, and sharing it means two drivers reconfiguring one
-peripheral with different pins.
+**Corrected 2026-09-15:** this table used to pair Face with GPIO4/15
+(hardware bus) and Bubble with GPIO32/33 (bit-banged) — the two physical
+panels turned out to be mounted reversed relative to that wiring, so content
+was landing on the wrong screen. `main.cpp` now builds `oled` on the
+GPIO32/33 pins and `oledText` on GPIO4/15 instead (see the comment above
+their declarations), which is the swap reflected in the table above. The
+GPIO-level facts below (which pins to avoid and why) are about the physical
+pins themselves and didn't change — only which panel/content each pin pair
+drives did. Net effect: the avatar now runs on the slower 400kHz bit-banged
+bus instead of the 800kHz hardware one; re-wiring instead of swapping in
+software would recover that speed, but wasn't done here.
 
-**Why the bubble panel is on GPIO32/33 instead of a second hardware port:**
-the ESP32 classic only has two hardware I2C peripherals, and both are already
-spoken for (port 0 by M5Unified, port 1 by the face panel). `SSD1306Display`
-in `ssd1306_display.h` passes its `i2c_port` argument straight through to
-LGFX's `Bus_I2C`, which treats a **negative** port number as a request for its
-bit-banged software I2C path (`soft_i2c.inl`) on whatever GPIOs you give it —
-so `oledText` in `main.cpp` is constructed with port `-1` and pins 32/33
-instead. GPIO32/33 were picked because they're not boot-strapping pins, not
-the SPI-flash pins (6-11), and not already claimed by the face panel or
-M5Unified. Clocked at 400kHz rather than the face panel's 800kHz, since
-bit-banged timing is CPU-cycle-bound and less forgiving at high speed.
+**Do not move GPIO4 (now the bubble panel's SDA) to GPIO2.** GPIO2 is a
+boot-strapping pin; the OLED's pull-up on it holds the ESP32 out of USB
+download mode (`Wrong boot mode detected (0x1b)`) and flashing fails whenever
+the display is attached. Same lesson the sibling `hello-world` panel learned
+on 2026-09-14. Port 1 (now the bubble panel's bus) is likewise deliberate:
+M5Unified's `begin()` claims port 0 for its own PortA devices, and sharing it
+means two drivers reconfiguring one peripheral with different pins.
+
+**Why one panel is on GPIO32/33 instead of a second hardware port:** the
+ESP32 classic only has two hardware I2C peripherals, and both are already
+spoken for (port 0 by M5Unified, port 1 by the other OLED panel).
+`SSD1306Display` in `ssd1306_display.h` passes its `i2c_port` argument
+straight through to LGFX's `Bus_I2C`, which treats a **negative** port number
+as a request for its bit-banged software I2C path (`soft_i2c.inl`) on
+whatever GPIOs you give it — so `oled` in `main.cpp` is constructed with port
+`-1` and pins 32/33. GPIO32/33 were picked because they're not
+boot-strapping pins, not the SPI-flash pins (6-11), and not already claimed
+by the other OLED panel or M5Unified. Clocked at 400kHz rather than the
+hardware bus's 800kHz, since bit-banged timing is CPU-cycle-bound and less
+forgiving at high speed.
 
 ## The speech bubble (second panel)
 
@@ -112,11 +125,14 @@ M5GFX ships `lgfx::Panel_SSD1306` but no device wrapper for it (only
 that wrapper, written to the same shape as M5GFX's own `M5UnitOLED.h`. It is
 attached with `M5.addDisplay()` + `M5.setPrimaryDisplay()`.
 
-Ordering is load-bearing: **`oled.init()` must come after `M5.begin()`.**
-`M5.begin()` runs M5GFX board autodetect, which probes SPI pins — GPIO15 among
-them, which is our SCL. Initialising the OLED afterwards re-owns those pins and
-sends the SSD1306 its full reset sequence. The other order leaves the panel
-blank.
+Ordering is load-bearing: **each panel's `.init()` must come after
+`M5.begin()`.** `M5.begin()` runs M5GFX board autodetect, which probes SPI
+pins — GPIO15 among them. Since the 2026-09-15 pin swap (see Wiring above),
+GPIO15 is `oledText`'s SCL, not `oled`'s, so this now bears on
+`oledText.init()` rather than `oled.init()` — but both already run after
+`M5.begin()`, so the requirement is satisfied either way. Initialising a
+panel afterwards re-owns whatever pins it uses and sends the SSD1306 its full
+reset sequence. The other order leaves the panel blank.
 
 **2. The stock face is drawn for a 320x240 canvas.** `m5avatar::Face` puts the
 eyes at x=90/230 and the mouth at y=148; the library's own `faces/OledFace.h`
@@ -150,6 +166,207 @@ PLATFORMIO_BUILD_FLAGS="-DAVATAR_FB_DUMP" pio run -t upload     # + framebuffer 
 
 Note `pio device monitor` fails in a non-TTY shell (`termios.error: (19,
 Operation not supported by device)`) — read the port with pyserial instead.
+
+## Boot screen and splash
+
+Every power-up now opens with the HLI boot POST + splash intro — ported
+verbatim from `~/Code/esp32_oled/HLI` (`include/boot.h`+`src/boot.cpp`,
+`include/splash.h`+`src/splash.cpp`, `include/ui.h`+`src/ui.cpp`,
+`include/brand.h`) — before `M5.begin()` hands both panels to the avatar and
+the clock. Both are pure functions of elapsed ms plus a `U8G2&`, with no
+app/network dependency, so they carried over unmodified; only `main.cpp`
+changed.
+
+**Splash plays on the face/top panel, POST plays on the bubble/bottom
+panel, concurrently** — not the same sequence on one panel, back to back.
+The synthwave splash is the flashy full-frame graphic, so it runs where the
+avatar lives afterward; the POST is scrolling console text, so it runs where
+the clock's own text lives afterward. Two separate `U8G2` instances in
+`main.cpp` do this: `u8g2Face` (hardware I2C, same GPIO4/15 as `oled`) draws
+`splash::draw()`, `u8g2Boot` (software/bit-banged I2C, same GPIO32/33 as
+`oledText`) draws `boot::draw()`, both inside one `while` loop in `setup()`.
+Because POST (6.47s) outlasts the splash intro (4.78s), the loop keeps
+running boot alone for the last ~1.7s while the splash side just holds its
+settled final frame — total added boot time is POST's own length, not the
+sum of both.
+
+They draw through U8g2's own I2C drivers rather than through
+`ssd1306_display.h`'s LGFX wrapper: porting `boot.cpp`/`splash.cpp`'s ~40 raw
+`U8G2` draw calls (XOR bars, dot leaders, a hand-drawn 32px glyph, the
+5x-pixel outrun grid) to LGFX wasn't worth it for a sequence that plays once
+and hands off.
+
+**Two different I2C drivers share each pair of pins, one after the other,
+not at once.** `u8g2Face`'s Arduino HW-I2C backend drives GPIO4/15 via
+`Wire` (I2C_NUM_0); `SSD1306Display` (`oled`) drives the same pins via
+LGFX's `Bus_I2C` on I2C_NUM_1. `Wire.end()` right after the boot/splash loop
+releases I2C_NUM_0 before `M5.begin()` + `oled.init()` reclaim the pins on
+I2C_NUM_1 — the same "ordering is load-bearing, pins get re-owned" pattern
+the M5.begin()-then-oled.init() sequence below already relies on, just one
+hop earlier. `u8g2Boot`'s software I2C on GPIO32/33 needs no equivalent
+release: bit-banging is plain `digitalWrite()`, so there's nothing left
+running for `oledText.init()` to contend with once the loop exits.
+
+`olikraus/U8g2 @ ^2.35.30` was added to `lib_deps` for this.
+
+**Correction, 2026-09-15:** this section originally said the single `u8g2`
+instance was built at `U8G2_R2` "to match `M5.Display.setRotation(2))`" and
+that boot+splash ran sequentially on one panel over ~11.2s. Both were wrong
+in ways only visible with eyes on the actual panel: U8g2's rotation and
+LGFX's `rotation(2)` don't agree for this SSD1306 driver/panel combination,
+so `U8G2_R2` rendered upside down despite matching the avatar's own
+rotation — `U8G2_R0` is correct here. And splitting boot/POST onto their own
+panels (this section, same date) made "sequential on one panel" moot. The
+old reading was believable because U8g2's `U8G2_R2` and LGFX's
+`setRotation(2)` share the same "180 degrees" name; they just don't rotate
+the same panel the same way.
+
+**A single DOS-BIOS-style POST beep** fires on the piezo (`PIEZO_PIN`,
+GPIO27) the instant the POST side finishes — `tone(PIEZO_PIN, 1000, 150)` in
+`main.cpp`'s boot/splash loop, gated on a `posted` flag so it fires exactly
+once regardless of how much longer the splash side keeps running. This is
+the classic "self test passed, handing off to the bootloader" chime
+(AMI/Award BIOSes: one short beep = good), not a beep per POST line — real
+BIOSes are silent through the self test and only speak once, at the end.
+
+Verified live 2026-09-15 on the same board as above: `pio run` builds clean
+at 45.5% flash / 19.9% RAM (up ~0.1% from the single-panel version above —
+the second `U8G2` instance costs one more small framebuffer + driver
+instantiation, nothing more). `pio run -t upload` flashed successfully.
+Three separate DTR/RTS-reset serial captures landed "WiFi: connecting..."
+at 14.87-14.88s (down from the old sequential design's ~17.5s, consistent
+with POST-only being ~4.8s shorter than POST+splash-in-series). One of the
+three captures crashed instead, at the MQTT-connect step, on an lwIP assert
+(`udp_new_ip_type ... Required to lock TCPIP core functionality`) — nothing
+in this change touches networking, and the other two resets (before and
+after it) completed cleanly, so this reads as pre-existing intermittent
+flakiness rather than something introduced here, but it's noted rather than
+swept under the rug in case it recurs. The panel's actual pixels weren't
+eyeballed as part of this check (no camera on this session) — worth a glance
+next power-up to confirm the split/orientation actually reads as intended,
+given the rotation correction above came from exactly that kind of miss.
+
+**Correction/update, 2026-09-16:** three more changes, made on feedback from
+actually looking at the panel — proof the "worth a glance" note above was
+right to flag.
+
+- **POST and splash swapped panels.** POST now plays on the top/face panel
+  (`u8g2Top`, was `u8g2Face`), splash on the bottom/bubble panel
+  (`u8g2Bottom`, was `u8g2Boot`) — the reverse of what this section said
+  above. The two `U8G2` instances in `main.cpp` are now named for physical
+  position, not content, since content has already moved once.
+- **The loop no longer freezes either sequence once it individually
+  finishes.** Previously, `splash::draw()` only got called while
+  `splash::intro()` was true, so once its 4.78s intro ended (before POST's
+  6.47s did) it froze on the settled title-card frame instead of falling
+  into its own attract loop (kicker lines cycling, scan bar sweeping).
+  Both sides now draw every frame unconditionally, and a `POST_HOLD_MS`
+  (2000ms) constant keeps the loop running for a further beat once *both*
+  are done, specifically so that attract-loop motion — and POST's cursor
+  still blinking — are actually visible before `M5.begin()` takes the
+  panels, rather than the app moving on the instant the longer sequence's
+  one-shot ends.
+- **POST's console font changed** from `u8g2_font_4x6_tf` to
+  `u8g2_font_5x8_tf`, to match mqttchan's own "message screen"
+  (`SpeechBubble`'s font — LGFX's default, the classic 5x7-glyph/6x8-cell
+  GLCD font, see `speech_bubble.h`) instead of the original HLI source
+  project's tighter one. This shrank the console grid from 32x10 to 25x8
+  (`ui.h`'s `CW`/`CH`/`COLS`/`ROWS`); every existing BIOS/POST line in
+  `brand.h` already fit under the new 25-column limit without editing
+  (longest is exactly 25). Splash's own kicker-line font is untouched —
+  still 4x6 — so `splash.cpp`'s one call that used to reuse `ui::CH` for
+  its static-noise band height now uses a literal `6` instead, so it didn't
+  drift when the shared constant it borrowed changed size for an unrelated
+  reason.
+
+Verified live 2026-09-16 on the same board: `pio run` builds clean at 45.5%
+flash / 19.9% RAM (unchanged from the numbers above to one decimal place).
+`pio run -t upload` flashed successfully; a DTR/RTS-reset serial capture
+landed "WiFi: connecting..." at 17.89s (up from 14.87-14.88s above by
+almost exactly `POST_HOLD_MS`'s 2000ms, as expected), then through to "MQTT:
+connected and subscribed" / "BLE: advertising" with no crash. Panel pixels
+still weren't eyeballed this round either (still no camera on this
+session) — this entire update exists *because* a human did look at the
+previous round, so that glance is doubly worth doing again here.
+
+**Correction, 2026-09-15: the two physical panels turned out to be mounted
+reversed** relative to all of the pin numbers above — a hardware fact, not a
+content-placement choice like the 2026-09-16 swap above. `u8g2Top` and `oled`
+(the "top/face" role) now run on GPIO32/33 (software/bit-banged I2C, so
+`u8g2Top` changed from the `HW_I2C` template to `SW_I2C`); `u8g2Bottom` and
+`oledText` (the "bottom/bubble" role) now run on GPIO4/15 (hardware I2C, so
+`u8g2Bottom` changed the other way). See the Wiring section above for the
+corrected pin table and the trade-off this introduces (the avatar now
+animates over the slower bit-banged bus). `u8g2Top`/`u8g2Bottom` keep their
+physical-position names and still draw the same content (POST on top, splash
+on bottom) as the 2026-09-16 section above describes — only the electrical
+pins underneath moved. Not yet re-verified live on hardware; flash and check
+both the boot sequence and the running avatar/bubble land on the intended
+physical screen before trusting this.
+
+**Correction/update, 2026-09-15 (later the same day): boot and splash are no
+longer concurrent, and splash now plays a synthwave riff on the piezo.**
+Three changes, on top of the physical-panel-reversal correction just above:
+
+- **The shared `while` loop is gone.** `setup()` now runs POST and splash as
+  two fully separate phases — POST alone on `u8g2Top` first, then (once
+  `boot::done()`) splash alone on `u8g2Bottom` — rather than drawing both to
+  one shared frame clock. This turned out to be why *both* were reported
+  janky, not just the slower panel: sharing one loop meant each sequence's
+  own animation was throttled down to whatever pace the loop as a whole
+  could sustain, which was however long the slower panel's send took,
+  regardless of how fast the other one's own bus was. Whichever panel isn't
+  currently playing is blanked rather than drawn to for no reason.
+- **`u8g2Top` (POST, now on GPIO32/33 after the pin-reversal fix above) moved
+  off U8g2's software I2C onto the ESP32's second hardware I2C peripheral**
+  (`Wire1`), via U8g2's `_2ND_HW_I2C` constructor variant and a new
+  `-D U8X8_HAVE_2ND_HW_I2C` build flag in `platformio.ini` (without that flag
+  the constructor is a silent no-op — U8g2 only defines the macro itself on
+  boards that declare `WIRE_INTERFACES_COUNT > 1`, which `esp32dev` doesn't).
+  U8g2's own software I2C bit-bangs through `digitalWrite()` per bit, which
+  is slow enough that sending one 1024-byte frame plausibly took tens of
+  ms — independently of the shared-loop problem above, and the likely actual
+  cause of POST's own reported jank. `u8g2Bottom` (splash) didn't need this:
+  it already sits on GPIO4/15's real hardware peripheral (global
+  `Wire`/I2C_NUM_0). `Wire1.end()` releases the peripheral before `oled`
+  (LGFX, its own bit-banged path on the same GPIO32/33 pins) claims them at
+  runtime — this one isn't just hygiene the way `Wire.end()` for `Wire` is,
+  since a hardware peripheral left attached to those pins would otherwise
+  still be driving them alongside `oled`'s plain `digitalWrite()` bit-banging.
+- **Splash now plays a monophonic synthwave arpeggio on the piezo**
+  (`splash::playTheme()`, called from `main.cpp`'s splash phase alongside
+  `splash::draw()`) — the "retro cassette" half of a request to give the
+  intro more of that vibe; the visuals were already outrun/synthwave (the
+  sun, the grid, the neon skyline), and this is what makes it read as a tape
+  playing rather than just a screen lighting up. A minor pentatonic scale, a
+  slow rising phrase while the world assembles, a driving arpeggio through
+  the approach that quickens toward the slam, a hit on the slam, and two
+  resolving notes as the mark and kicker land — driven by an explicit stage
+  machine (`ThemeStage` in `splash.cpp`) rather than matching beats by time
+  window, since `T_MARK` falls inside the slam's own `[T_FLASH,
+  T_FLASH+D_FLASH)` window and a naive time-window match would double-fire
+  the slam beat instead of the mark beat.
+
+`pio run` builds clean at 45.6% flash / 19.9% RAM (consistent with the
+figures above).
+
+Verified live 2026-09-15: `pio run -t upload` flashed successfully. Two
+back-to-back DTR/RTS-reset serial captures both reached "WiFi: connected" →
+"MQTT: connected and subscribed" → "BLE: advertising" with no crash. One of
+the two captures logged a single early transient:
+`[900][E][esp32-hal-i2c-ng.c:275] i2cWrite(): i2c_master_transmit failed:
+[259] ESP_ERR_INVALID_STATE`, right around when `u8g2Top`'s POST console
+would be sending its first frames over the new `Wire1` path — the other
+capture didn't show it at all, so it's intermittent rather than
+deterministic, and in both runs the board carried on and booted cleanly
+regardless. Plausibly a one-off hiccup on `Wire1`'s very first transaction
+after `Wire1.begin()`, harmless in practice since U8g2 resends the whole
+POST frame every ~16ms anyway — a single dropped frame in a several-hundred-
+frame sequence would be invisible. **Not confirmed by eye yet** — this
+session has no camera, so whether POST/splash actually read as smooth, and
+whether that intermittent error ever shows up as a visible glitch on the
+panel, still wants an actual look at the hardware next time someone's near
+it. The synthwave riff likewise hasn't been listened to yet.
 
 ## MQTT-driven mode
 
@@ -186,6 +403,22 @@ A few sharp edges worth knowing if this stops working:
   and hammering `client.connect()` against a dead link.
 - The board publishes `avatar/status` (`"online"`/`"offline"` via MQTT LWT,
   retained) so anything watching can tell if it's actually up.
+- **`MqttLink::showStartupInfo()`'s bubble message** (shown once, right after
+  `appTask` connects, before the normal message queue starts servicing) now
+  reports MQTT host/port/status, WiFi hostname (`mqttchan`, set via
+  `WiFi.setHostname()` in `connectWiFi()` — ahead of `WiFi.begin()`, since
+  ESP32 only honors it if set before the connection is made) + IP, and the
+  BLE device name/address — added 2026-09-15 so all of that is readable off
+  the panel itself rather than needing a laptop. `main.cpp`'s `appTask` had
+  to move `bleConfig.begin()` earlier, ahead of this call instead of after
+  it, so the BLE address (`NimBLEDevice::getAddress()`) exists yet.
+- **The "ISS is passing overhead" message some sessions saw isn't from this
+  repo at all** — it's `~/Homelab/osmo/avatar-brain`'s `producers/iss.py`, a
+  separate MQTT publisher that polls a live-position API and posts to
+  `avatar/say` when the ISS is within 500km, in a project this board just
+  happens to subscribe to. Disabled 2026-09-15 in that repo's `main.py`
+  (`IssPasses()` dropped from `PRODUCERS`) at Kevin's request — the producer
+  file itself is left in place there in case it's wanted back.
 - Flash usage is noticeably tighter in this mode: **88% of the 1.25MB app
   partition** (vs 46% in demo mode) once WiFi + PubSubClient + ArduinoJson are
   linked in — still fits, but there isn't a lot of headroom left for more
