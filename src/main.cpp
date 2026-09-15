@@ -23,7 +23,10 @@
 #include "ssd1306_display.h"
 #include "small_oled_face.h"
 #include "speech_bubble.h"
+#include "digital_clock.h"
 #include "mqtt_link.h"
+#include "device_settings.h"
+#include "ble_config.h"
 #include "secrets.h"
 
 // SSD1306 on SDA=GPIO4, SCL=GPIO15, address 0x3C.
@@ -49,11 +52,25 @@
 #define OLED_TEXT_SCL 33
 #define OLED_TEXT_I2C_PORT (-1)
 
+// Passive piezo for the per-character beep in the speech bubble (see
+// SpeechBubble's onChar hook). GPIO27 avoids both OLEDs' pins above, the
+// boot-strapping pins (0/2/5/12), and the flash pins (6-11).
+#define PIEZO_PIN 27
+
 static SSD1306Display oled(OLED_SDA, OLED_SCL);
 static SSD1306Display oledText(OLED_TEXT_SDA, OLED_TEXT_SCL, 400000,
                                 OLED_TEXT_I2C_PORT, 0x3C);
 static m5avatar::Avatar avatar;
 static SpeechBubble *bubble = nullptr;
+// The bubble panel's idle/default face — MqttLink switches back to this once
+// a message has finished displaying (see mqtt_link.h's handleMessage()).
+// Named idleClock, not clock: that shadows <time.h>'s clock() at global scope
+// and fails to compile.
+static DigitalClock *idleClock = nullptr;
+
+// tone() is non-blocking (LEDC-driven), so this is safe to call from inside
+// SpeechBubble::show()'s per-character reveal loop without slowing it down.
+static void beepChar() { tone(PIEZO_PIN, 1800, 15); }
 
 static const char *const kExpressionNames[] = {"Happy",  "Angry",  "Sad",
                                                "Doubt",  "Sleepy", "Neutral"};
@@ -168,9 +185,52 @@ static void appTask(void *) {
 #ifdef AVATAR_DEMO_MODE
   demoLoop();
 #else
+  // secrets.h values are only the first-boot defaults; once BLE config saves
+  // anything, NVS wins from then on (see device_settings.h). The tz/hold/
+  // keepLast defaults come from DigitalClock/this file rather than secrets.h
+  // since they aren't secrets, just first-boot behavior.
+  static DeviceSettings settings;
+  settings.load(WIFI_SSID, WIFI_PASS, MQTT_HOST, MQTT_PORT, MQTT_TOPIC,
+                DigitalClock::kDefaultTz, /*defaultMessageHoldSeconds=*/30,
+                /*defaultKeepLastMessage=*/false);
+
   static MqttLink mqttLink(&avatar, bubble, kExpressionNames, kExpressions,
-                            kExpressionCount);
-  mqttLink.begin(WIFI_SSID, WIFI_PASS, MQTT_HOST, MQTT_PORT, MQTT_TOPIC);
+                            kExpressionCount, idleClock);
+  mqttLink.begin(settings.ssid, settings.pass, settings.host, settings.port,
+                 settings.topic);
+  mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
+                              settings.keepLastMessage);
+  if (idleClock != nullptr) idleClock->setTimezone(settings.tz);
+
+  // BLE config: a phone (nRF Connect, LightBlue, ...) can connect, read/write
+  // WiFi+MQTT+display settings, and push a one-off test message through the
+  // same {"text":...,"expression":...} JSON path MQTT uses — see
+  // ble_config.h.
+  static BleConfigService bleConfig;
+  bleConfig.begin(
+      "MqttChan-Config",
+      [](const JsonDocument &doc) {
+        settings.applyAndSave(doc);
+        mqttLink.reconfigure(settings.ssid, settings.pass, settings.host,
+                              settings.port, settings.topic);
+        mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
+                                    settings.keepLastMessage);
+        if (idleClock != nullptr) idleClock->setTimezone(settings.tz);
+        Serial.println("BLE: settings updated, reconnecting");
+      },
+      [](const uint8_t *data, size_t len) {
+        mqttLink.injectMessage(data, len);
+      },
+      [](JsonDocument &doc) {
+        // pass_ intentionally omitted from reads - write-only over BLE.
+        doc["ssid"] = settings.ssid;
+        doc["host"] = settings.host;
+        doc["port"] = settings.port;
+        doc["topic"] = settings.topic;
+        doc["tz"] = settings.tz;
+        doc["holdSeconds"] = settings.messageHoldSeconds;
+        doc["keepLast"] = settings.keepLastMessage;
+      });
 
 #ifdef AVATAR_FB_DUMP
   // Headless bench test: exercise the parse-and-display path with a
@@ -182,8 +242,20 @@ static void appTask(void *) {
   dumpBubbleFramebuffer("MQTT bench test");
 #endif
 
+  uint32_t lastStatusPush = 0;
   for (;;) {
     mqttLink.loop();
+    // handleMessage() runs synchronously inside mqttLink.loop() above, so
+    // this never races a message reveal for the oledText panel — by the
+    // time control gets here the bubble is either idle or just went idle.
+    if (idleClock != nullptr) idleClock->tick();
+    // Refresh the BLE status characteristic every couple seconds rather than
+    // every 50ms tick - it's read-on-demand by the client, not notified.
+    uint32_t now = millis();
+    if (now - lastStatusPush > 2000) {
+      bleConfig.setStatus(mqttLink.statusString());
+      lastStatusPush = now;
+    }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 #endif
@@ -228,11 +300,15 @@ void setup() {
   // touches it — accessed only through `bubble` below. If it's missing or at
   // the wrong address this just logs and carries on without it; the avatar
   // half of the demo doesn't depend on it.
+  pinMode(PIEZO_PIN, OUTPUT);
+
   if (oledText.init()) {
     M5.addDisplay(oledText);
     oledText.setRotation(2);
-    bubble = new SpeechBubble(&oledText);
-    bubble->clear();
+    bubble = new SpeechBubble(&oledText, beepChar);
+    idleClock = new DigitalClock(&oledText);
+    idleClock->begin();
+    idleClock->showNow();
   } else {
     Serial.println(
         "Second SSD1306 (text) init failed - check wiring on SDA=32 "

@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>mqttchan control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    justify-content: center;
+    padding: 2rem 1rem 4rem;
+  }
+  #app { width: 100%; max-width: 420px; }
+  h1 { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; }
+  h2 {
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #999;
+    margin: 0 0 0.8rem;
+  }
+  section {
+    margin-top: 1.6rem;
+    padding-top: 1.4rem;
+    border-top: 1px solid #2a2a2a;
+  }
+  .modes {
+    display: flex;
+    border: 1px solid #444;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 0.8rem;
+  }
+  .modes button {
+    flex: 1;
+    border: none;
+    border-radius: 0;
+    background: #1c1c1c;
+    color: #999;
+  }
+  .modes button.active { background: #2f6feb; color: white; }
+  .conn-row { display: flex; align-items: center; gap: 0.6rem; }
+  .status { font-size: 0.85rem; }
+  .status.connected { color: #4caf50; }
+  .status.connecting { color: #ffb74d; }
+  .status.error { color: #e57373; }
+  .status.idle { color: #777; }
+  .device-status {
+    font-size: 0.78rem;
+    color: #777;
+    margin-top: 0.5rem;
+  }
+  .hint {
+    font-size: 0.8rem;
+    color: #777;
+    margin-top: 0.6rem;
+    line-height: 1.4;
+  }
+  textarea, input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.6rem;
+    border-radius: 6px;
+    border: 1px solid #444;
+    background: #1c1c1c;
+    color: #eee;
+    font-size: 0.95rem;
+  }
+  textarea { min-height: 90px; resize: vertical; }
+  input[type="range"] {
+    padding: 0;
+    border: none;
+    background: transparent;
+    accent-color: #2f6feb;
+  }
+  .checkbox-field label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: #ccc;
+    cursor: pointer;
+  }
+  .checkbox-field input[type="checkbox"] {
+    width: auto;
+    accent-color: #2f6feb;
+  }
+  select, button {
+    font-size: 0.95rem;
+    padding: 0.5rem;
+    border-radius: 6px;
+    border: 1px solid #444;
+    background: #1c1c1c;
+    color: #eee;
+  }
+  .row { display: flex; gap: 0.6rem; margin-top: 0.8rem; }
+  select { flex: 1; }
+  button {
+    background: #2f6feb;
+    border-color: #2f6feb;
+    color: white;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.secondary { background: #1c1c1c; border-color: #444; color: #eee; }
+  .sent-log {
+    margin-top: 1rem;
+    font-size: 0.8rem;
+    color: #999;
+    white-space: pre-wrap;
+  }
+  .field { margin-top: 0.7rem; }
+  .field label {
+    display: block;
+    font-size: 0.8rem;
+    color: #999;
+    margin-bottom: 0.3rem;
+  }
+  .save-status {
+    font-size: 0.8rem;
+    margin-top: 0.7rem;
+    min-height: 1.1em;
+  }
+  .save-status.ok { color: #4caf50; }
+  .save-status.error { color: #e57373; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>mqttchan control</h1>
+
+  <div class="modes">
+    <button :class="{ active: mode === 'bluetooth' }" @click="switchMode('bluetooth')">Bluetooth (device)</button>
+    <button :class="{ active: mode === 'mqtt' }" @click="switchMode('mqtt')">MQTT (dev)</button>
+  </div>
+
+  <div class="conn-row">
+    <button v-if="!connected" @click="connect" :disabled="connecting || (mode === 'bluetooth' && !bleSupported)">
+      {{ connecting ? "Connecting…" : "Connect" }}
+    </button>
+    <button v-else class="secondary" @click="disconnect">Disconnect</button>
+    <span class="status" :class="statusClass">{{ statusText }}</span>
+  </div>
+  <div class="device-status" v-if="mode === 'bluetooth' && connected">Device: {{ deviceStatus || "…" }}</div>
+  <p class="hint" v-if="mode === 'bluetooth' && !bleSupported">
+    Web Bluetooth isn't available in this browser (needs Chrome/Edge on desktop or Android,
+    over HTTPS or localhost). Use MQTT mode instead, or switch browsers.
+  </p>
+
+  <section>
+    <h2>Send message</h2>
+    <textarea v-model="text" placeholder="What should the avatar say?" maxlength="200"></textarea>
+    <div class="row">
+      <select v-model="expression">
+        <option v-for="e in expressions" :key="e" :value="e">{{ e }}</option>
+      </select>
+      <button :disabled="!connected" @click="send">Send</button>
+    </div>
+    <div class="sent-log" v-if="lastSent">Last sent: {{ lastSent }}</div>
+  </section>
+
+  <section>
+    <h2>Settings</h2>
+    <template v-if="mode === 'bluetooth'">
+      <div class="field">
+        <label>WiFi SSID</label>
+        <input v-model="settings.ssid" :disabled="!connected" />
+      </div>
+      <div class="field">
+        <label>WiFi password (leave blank to keep current)</label>
+        <input v-model="settings.pass" type="password" :disabled="!connected" autocomplete="new-password" />
+      </div>
+      <div class="field">
+        <label>MQTT host</label>
+        <input v-model="settings.host" :disabled="!connected" />
+      </div>
+      <div class="field">
+        <label>MQTT port</label>
+        <input v-model.number="settings.port" type="number" min="1" max="65535" :disabled="!connected" />
+      </div>
+      <div class="field">
+        <label>MQTT topic</label>
+        <input v-model="settings.topic" :disabled="!connected" />
+      </div>
+      <div class="field">
+        <label>Timezone preset</label>
+        <select @change="applyTzPreset($event.target.value)" :disabled="!connected">
+          <option value="">(custom — edit the field below)</option>
+          <option v-for="p in TZ_PRESETS" :key="p.tz" :value="p.tz">{{ p.label }}</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Timezone (POSIX TZ string)</label>
+        <input v-model="settings.tz" :disabled="!connected" placeholder="e.g. NZST-12NZDT,M9.5.0,M4.1.0/3" />
+      </div>
+      <div class="field">
+        <label>Message display time: {{ settings.holdSeconds }}s</label>
+        <input type="range" min="1" max="60" step="1" v-model.number="settings.holdSeconds"
+               :disabled="!connected || settings.keepLastMessage" />
+      </div>
+      <div class="field checkbox-field">
+        <label>
+          <input type="checkbox" v-model="settings.keepLastMessage" :disabled="!connected" />
+          Keep the last message on the screen (don't revert to the clock)
+        </label>
+      </div>
+      <div class="row">
+        <button :disabled="!connected || saving" @click="saveSettings">{{ saving ? "Saving…" : "Save settings" }}</button>
+      </div>
+      <div class="save-status" :class="saveStatusClass">{{ saveStatusText }}</div>
+    </template>
+    <p class="hint" v-else>
+      Device settings (WiFi, MQTT server, topic) are read/written over Bluetooth only —
+      switch to Bluetooth mode and connect to the device to change them.
+    </p>
+  </section>
+</div>
+
+<script>
+const { createApp, ref, reactive, computed } = Vue;
+
+// Same broker/topic/expression set the firmware uses (include/secrets.h,
+// src/main.cpp) — browsers can't speak raw MQTT/TCP, so MQTT mode connects
+// over the WebSocket listener Caddy fronts at wss://mqtt.kev.nz, per
+// Homelab/osmo/mosquitto/README.md. This is the "no hardware nearby" dev path;
+// it can't reach device settings, which only exist over the BLE GATT link.
+const BROKER_URL = "wss://mqtt.kev.nz/";
+const MQTT_TOPIC = "avatar/say";
+const EXPRESSIONS = ["Happy", "Angry", "Sad", "Doubt", "Sleepy", "Neutral"];
+
+// Must match include/ble_config.h exactly - these are the firmware's GATT
+// service/characteristic UUIDs, not placeholders.
+const BLE_SERVICE_UUID = "9f2e0000-9b5f-4a2e-8b7a-9c9f6f5b1a10";
+const BLE_CONFIG_CHAR_UUID = "9f2e0001-9b5f-4a2e-8b7a-9c9f6f5b1a10";
+const BLE_TEST_CHAR_UUID = "9f2e0002-9b5f-4a2e-8b7a-9c9f6f5b1a10";
+const BLE_STATUS_CHAR_UUID = "9f2e0003-9b5f-4a2e-8b7a-9c9f6f5b1a10";
+
+// POSIX TZ strings, not IANA names — that's what DigitalClock::setTimezone()
+// (configTzTime()) expects. A handful of common zones as a convenience; the
+// text field below always stays editable for anything else.
+const TZ_PRESETS = [
+  { label: "Pacific/Auckland (NZST/NZDT)", tz: "NZST-12NZDT,M9.5.0,M4.1.0/3" },
+  { label: "UTC", tz: "UTC0" },
+  { label: "London (GMT/BST)", tz: "GMT0BST,M3.5.0/1,M10.5.0" },
+  { label: "New York (EST/EDT)", tz: "EST5EDT,M3.2.0,M11.1.0" },
+  { label: "Los Angeles (PST/PDT)", tz: "PST8PDT,M3.2.0,M11.1.0" },
+  { label: "Sydney (AEST/AEDT)", tz: "AEST-10AEDT,M10.1.0,M4.1.0/3" },
+];
+
+createApp({
+  setup() {
+    const mode = ref("bluetooth");
+    const bleSupported = !!navigator.bluetooth;
+
+    const connected = ref(false);
+    const connecting = ref(false);
+    const statusText = ref("not connected");
+    const statusClass = ref("idle");
+    const deviceStatus = ref("");
+
+    const text = ref("");
+    const expression = ref(EXPRESSIONS[0]);
+    const lastSent = ref("");
+
+    // pass_ is intentionally never populated from a device read (see
+    // ble_config.h's ConfigReader) - it's write-only, so it always starts
+    // blank and is only sent on save if the user typed something.
+    const settings = reactive({
+      ssid: "", pass: "", host: "", port: 0, topic: "",
+      tz: "", holdSeconds: 30, keepLastMessage: false,
+    });
+    const saving = ref(false);
+    const saveStatusText = ref("");
+    const saveStatusClass = ref("");
+
+    let mqttClient = null;
+    let bleDevice = null;
+    let bleServer = null;
+    let bleConfigChar = null;
+    let bleTestChar = null;
+    let bleStatusChar = null;
+    let blePollTimer = null;
+
+    function setStatus(text_, cls) {
+      statusText.value = text_;
+      statusClass.value = cls;
+    }
+
+    function switchMode(next) {
+      if (next === mode.value) return;
+      disconnect();
+      mode.value = next;
+      setStatus("not connected", "idle");
+    }
+
+    // --- MQTT mode (dev, no hardware needed) ---
+
+    function connectMqtt() {
+      connecting.value = true;
+      setStatus("connecting…", "connecting");
+      mqttClient = mqtt.connect(BROKER_URL, { reconnectPeriod: 2000 });
+
+      mqttClient.on("connect", () => {
+        connecting.value = false;
+        connected.value = true;
+        setStatus("connected to " + BROKER_URL, "connected");
+      });
+      mqttClient.on("reconnect", () => setStatus("reconnecting…", "connecting"));
+      mqttClient.on("close", () => {
+        connected.value = false;
+        setStatus("disconnected", "error");
+      });
+      mqttClient.on("error", (err) => {
+        connecting.value = false;
+        connected.value = false;
+        setStatus("error: " + err.message, "error");
+      });
+    }
+
+    function disconnectMqtt() {
+      if (mqttClient) {
+        mqttClient.end(true);
+        mqttClient = null;
+      }
+    }
+
+    function sendMqtt(payload) {
+      mqttClient.publish(MQTT_TOPIC, payload);
+    }
+
+    // --- Bluetooth mode (talks to the real device's BleConfigService) ---
+
+    async function connectBluetooth() {
+      connecting.value = true;
+      setStatus("choose the device…", "connecting");
+      try {
+        // requestDevice() only works inside a user-gesture handler (this
+        // click), and only over HTTPS or localhost - there's no way to
+        // auto-connect on page load the way MQTT mode does.
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [BLE_SERVICE_UUID] }],
+        });
+        setStatus("connecting…", "connecting");
+        bleDevice.addEventListener("gattserverdisconnected", handleBleDisconnected);
+        bleServer = await bleDevice.gatt.connect();
+        const service = await bleServer.getPrimaryService(BLE_SERVICE_UUID);
+        bleConfigChar = await service.getCharacteristic(BLE_CONFIG_CHAR_UUID);
+        bleTestChar = await service.getCharacteristic(BLE_TEST_CHAR_UUID);
+        bleStatusChar = await service.getCharacteristic(BLE_STATUS_CHAR_UUID);
+
+        await readSettingsFromDevice();
+        await readDeviceStatus();
+        // statusChar has no NOTIFY property (see ble_config.h), so polling
+        // is the only way to keep "Device: wifi=up mqtt=up" current.
+        blePollTimer = setInterval(readDeviceStatus, 5000);
+
+        connecting.value = false;
+        connected.value = true;
+        setStatus("connected to " + bleDevice.name, "connected");
+      } catch (err) {
+        connecting.value = false;
+        connected.value = false;
+        setStatus("error: " + err.message, "error");
+      }
+    }
+
+    function handleBleDisconnected() {
+      connected.value = false;
+      setStatus("disconnected", "error");
+      if (blePollTimer) clearInterval(blePollTimer);
+      blePollTimer = null;
+    }
+
+    function disconnectBluetooth() {
+      if (blePollTimer) clearInterval(blePollTimer);
+      blePollTimer = null;
+      if (bleDevice) bleDevice.removeEventListener("gattserverdisconnected", handleBleDisconnected);
+      if (bleServer && bleServer.connected) bleServer.disconnect();
+      bleDevice = null;
+      bleServer = null;
+      bleConfigChar = null;
+      bleTestChar = null;
+      bleStatusChar = null;
+    }
+
+    async function readSettingsFromDevice() {
+      const value = await bleConfigChar.readValue();
+      const doc = JSON.parse(new TextDecoder().decode(value));
+      settings.ssid = doc.ssid ?? "";
+      settings.host = doc.host ?? "";
+      settings.port = doc.port ?? 0;
+      settings.topic = doc.topic ?? "";
+      settings.tz = doc.tz ?? "";
+      settings.holdSeconds = doc.holdSeconds ?? 30;
+      settings.keepLastMessage = doc.keepLast ?? false;
+      settings.pass = "";
+    }
+
+    function applyTzPreset(tz) {
+      if (tz) settings.tz = tz;
+    }
+
+    async function readDeviceStatus() {
+      const value = await bleStatusChar.readValue();
+      deviceStatus.value = new TextDecoder().decode(value);
+    }
+
+    async function saveSettings() {
+      // Partial update, matching DeviceSettings::applyAndSave - only send
+      // fields with something in them so an untouched/blank field (notably
+      // pass) doesn't overwrite what's already saved on the device.
+      const doc = {};
+      if (settings.ssid) doc.ssid = settings.ssid;
+      if (settings.pass) doc.pass = settings.pass;
+      if (settings.host) doc.host = settings.host;
+      if (settings.port) doc.port = settings.port;
+      if (settings.topic) doc.topic = settings.topic;
+      if (settings.tz) doc.tz = settings.tz;
+      // holdSeconds/keepLast are real booleans/numbers once connected (not
+      // "blank means unchanged" fields like the ones above), so always send
+      // them rather than gating on truthiness - false/0 are valid choices.
+      doc.holdSeconds = settings.holdSeconds;
+      doc.keepLast = settings.keepLastMessage;
+
+      saving.value = true;
+      saveStatusText.value = "";
+      try {
+        const bytes = new TextEncoder().encode(JSON.stringify(doc));
+        await bleConfigChar.writeValue(bytes);
+        settings.pass = "";
+        saveStatusText.value = "Saved — device is reconnecting with the new settings.";
+        saveStatusClass.value = "ok";
+      } catch (err) {
+        saveStatusText.value = "Save failed: " + err.message;
+        saveStatusClass.value = "error";
+      } finally {
+        saving.value = false;
+      }
+    }
+
+    async function sendBluetooth(payload) {
+      const bytes = new TextEncoder().encode(payload);
+      await bleTestChar.writeValue(bytes);
+    }
+
+    // --- Mode-agnostic entry points used by the template ---
+
+    function connect() {
+      if (mode.value === "mqtt") connectMqtt();
+      else connectBluetooth();
+    }
+
+    function disconnect() {
+      if (mode.value === "mqtt") disconnectMqtt();
+      else disconnectBluetooth();
+      connected.value = false;
+      setStatus("not connected", "idle");
+    }
+
+    async function send() {
+      if (!connected.value) return;
+      const payload = JSON.stringify({ text: text.value, expression: expression.value });
+      try {
+        if (mode.value === "mqtt") sendMqtt(payload);
+        else await sendBluetooth(payload);
+        lastSent.value = payload;
+      } catch (err) {
+        setStatus("send failed: " + err.message, "error");
+      }
+    }
+
+    return {
+      mode, bleSupported, switchMode,
+      connected, connecting, statusText, statusClass, deviceStatus,
+      connect, disconnect,
+      text, expression, expressions: EXPRESSIONS, lastSent, send,
+      settings, saving, saveStatusText, saveStatusClass, saveSettings,
+      TZ_PRESETS, applyTzPreset,
+    };
+  },
+}).mount("#app");
+</script>
+</body>
+</html>
