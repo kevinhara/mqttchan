@@ -189,15 +189,11 @@
         <input v-model="settings.topic" :disabled="!connected" />
       </div>
       <div class="field">
-        <label>Timezone preset</label>
-        <select @change="applyTzPreset($event.target.value)" :disabled="!connected">
-          <option value="">(custom — edit the field below)</option>
-          <option v-for="p in TZ_PRESETS" :key="p.tz" :value="p.tz">{{ p.label }}</option>
+        <label>Timezone</label>
+        <select v-model="settings.tz" :disabled="!connected">
+          <option v-if="!settings.tz" value="" disabled>(not set)</option>
+          <option v-for="p in tzOptions" :key="p.tz" :value="p.tz">{{ p.label }}</option>
         </select>
-      </div>
-      <div class="field">
-        <label>Timezone (POSIX TZ string)</label>
-        <input v-model="settings.tz" :disabled="!connected" placeholder="e.g. NZST-12NZDT,M9.5.0,M4.1.0/3" />
       </div>
       <div class="field">
         <label>Message display time: {{ settings.holdSeconds }}s</label>
@@ -242,8 +238,9 @@ const BLE_TEST_CHAR_UUID = "9f2e0002-9b5f-4a2e-8b7a-9c9f6f5b1a10";
 const BLE_STATUS_CHAR_UUID = "9f2e0003-9b5f-4a2e-8b7a-9c9f6f5b1a10";
 
 // POSIX TZ strings, not IANA names — that's what DigitalClock::setTimezone()
-// (configTzTime()) expects. A handful of common zones as a convenience; the
-// text field below always stays editable for anything else.
+// (configTzTime()) expects. Only a fixed list of common zones is offered;
+// see tzOptions() below for how a device with some other TZ string set
+// (not through this dropdown) still shows up as a selectable option.
 const TZ_PRESETS = [
   { label: "Pacific/Auckland (NZST/NZDT)", tz: "NZST-12NZDT,M9.5.0,M4.1.0/3" },
   { label: "UTC", tz: "UTC0" },
@@ -402,9 +399,15 @@ createApp({
       settings.pass = "";
     }
 
-    function applyTzPreset(tz) {
-      if (tz) settings.tz = tz;
-    }
+    // The device may have a POSIX TZ string on it that isn't one of our
+    // presets (set some other way). Surface it as an extra option instead of
+    // silently dropping it, since the raw string field is gone.
+    const tzOptions = computed(() => {
+      if (settings.tz && !TZ_PRESETS.some((p) => p.tz === settings.tz)) {
+        return [{ label: `Current (${settings.tz})`, tz: settings.tz }, ...TZ_PRESETS];
+      }
+      return TZ_PRESETS;
+    });
 
     async function readDeviceStatus() {
       const value = await bleStatusChar.readValue();
@@ -481,7 +484,7 @@ createApp({
       connect, disconnect,
       text, expression, expressions: EXPRESSIONS, lastSent, send,
       settings, saving, saveStatusText, saveStatusClass, saveSettings,
-      TZ_PRESETS, applyTzPreset,
+      tzOptions,
     };
   },
 }).mount("#app");
