@@ -43,6 +43,15 @@ struct Step {
 // below has the character-by-character cadence. Two of these are brand jokes
 // rather than 286 hardware ("Cassette Bus", "Photon Array") — a light
 // industries company would test its own bus.
+// Filled in by begin() from the caller's Info, right before the script below
+// ever reads them — see the buffers' own comment further down for why they
+// can hold pointers into a `const Step[]` safely despite being written after
+// that array is constructed.
+static char sNameBuf[ui::COLS + 1];
+static char sSsidBuf[ui::COLS + 1];
+static char sBrokerBuf[ui::COLS + 1];
+static char sTopicBuf[ui::COLS + 1];
+
 static const Step SCRIPT[] = {
     { 420,    0, BANNER, brand::NAME,               nullptr},
     { 420,    0, PLAIN,  brand::BIOS,               nullptr},
@@ -59,9 +68,17 @@ static const Step SCRIPT[] = {
     {4180, 4380, TYPE,   "Serial 1,2",              "OK"    },
     {4400, 4600, TYPE,   "Real Time Clock",          "OK"   },
     {4620, 4820, TYPE,   "HLI Sync Bus",            "OK"    },
-    {4980,    0, BLANK,  nullptr,                   nullptr},
-    {5060,    0, TYPE,   "Booting from Fixed Disk 0", nullptr},
-    {5460,    0, TYPE,   brand::DOS,                nullptr},
+    // Real config, not more fake hardware — the reason someone would actually
+    // stop and read this screen instead of waiting it out. Same TYPE cadence
+    // as the self test above so it doesn't read as a different section.
+    {4840,    0, BLANK,  nullptr,                   nullptr},
+    {4920, 5120, TYPE,   "Device Name",             sNameBuf  },
+    {5140, 5340, TYPE,   "WiFi SSID",               sSsidBuf  },
+    {5360, 5560, TYPE,   "MQTT Broker",             sBrokerBuf},
+    {5580, 5780, TYPE,   "Topic",                   sTopicBuf },
+    {5940,    0, BLANK,  nullptr,                   nullptr},
+    {6020,    0, TYPE,   "Booting from Fixed Disk 0", nullptr},
+    {6420,    0, TYPE,   brand::DOS,                nullptr},
 };
 static const int N = sizeof(SCRIPT) / sizeof(SCRIPT[0]);
 
@@ -105,7 +122,25 @@ static uint32_t scriptEnd() {
   return end;
 }
 
-void begin() {
+// Fallback text for a field that isn't set - printed rather than the row
+// disappearing, so "(not set)" itself is the useful signal (e.g. a fresh
+// device that hasn't been configured over BLE yet).
+static const char* kUnset = "(not set)";
+
+static void fillField(char* dst, size_t cap, const char* val) {
+  strlcpy(dst, (val && *val) ? val : kUnset, cap);
+}
+
+void begin(const Info& info) {
+  fillField(sNameBuf, sizeof(sNameBuf), info.name);
+  fillField(sSsidBuf, sizeof(sSsidBuf), info.ssid);
+  if (info.host && *info.host) {
+    snprintf(sBrokerBuf, sizeof(sBrokerBuf), "%s:%u", info.host, info.port);
+  } else {
+    strlcpy(sBrokerBuf, kUnset, sizeof(sBrokerBuf));
+  }
+  fillField(sTopicBuf, sizeof(sTopicBuf), info.topic);
+
   startMs = millis();
   started = true;
 }

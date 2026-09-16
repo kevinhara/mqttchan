@@ -19,6 +19,12 @@ class SpeechBubble {
   explicit SpeechBubble(M5GFX *display, std::function<void()> onChar = nullptr)
       : display_(display), onChar_(std::move(onChar)) {}
 
+  // 1 (default) is the original small GLCD size this class was built around;
+  // 2 doubles both glyph dimensions ("Large" in the display settings). Takes
+  // effect on the next show() - textSize_ is only read there, so a message
+  // already typing out finishes at whatever size it started at.
+  void setTextSize(uint8_t size) { textSize_ = size; }
+
   // Reveals text one character at a time, typewriter-style. Lines are
   // wrapped up front (wrapping needs the whole word to measure it, so it
   // can't be decided mid-reveal) and then typed out line by line. Runs on
@@ -39,7 +45,7 @@ class SpeechBubble {
     // setTextSize() in place, which wrapLines()'s width math below would
     // otherwise inherit and wrap/print far too large to read.
     display_->setTextColor(TFT_WHITE, TFT_BLACK);
-    display_->setTextSize(1);
+    display_->setTextSize(textSize_);
     // Word-wrap by hand below; the built-in wrap breaks mid-word.
     display_->setTextWrap(false, false);
 
@@ -48,14 +54,17 @@ class SpeechBubble {
     display_->drawRoundRect(0, 0, display_->width(), display_->height(), 6,
                              TFT_WHITE);
 
+    // Scales with textSize_ - the base GLCD cell is 8px tall, so "Large"
+    // (textSize_ == 2) needs twice the row pitch or lines would overlap.
+    const int lineHeight = kBaseLineHeight * textSize_;
     // Lines beyond what fits inside the border scroll the content area
     // upward one row at a time instead of typing off the bottom of the
     // screen unseen — see scrollRect below for why this only affects text,
-    // not the border. maxLines is rounded down, so kLineHeight always
+    // not the border. maxLines is rounded down, so lineHeight always
     // divides the scroll region evenly and a scroll never leaves a sliver
     // of the previous line's pixels behind.
-    const int maxLines = (display_->height() - 2 * kMargin) / kLineHeight;
-    const int scrollHeight = maxLines * kLineHeight;
+    const int maxLines = (display_->height() - 2 * kMargin) / lineHeight;
+    const int scrollHeight = maxLines * lineHeight;
     // setScrollRect only affects scroll() below, not normal drawing/clipping,
     // so this can be set once up front without touching fillScreen/
     // drawRoundRect above or the per-character prints below.
@@ -67,7 +76,7 @@ class SpeechBubble {
     for (size_t lineIndex = 0; lineIndex < lines.size(); lineIndex++) {
       if (lineIndex > 0) {
         if (static_cast<int>(lineIndex) < maxLines) {
-          cursorY += kLineHeight;
+          cursorY += lineHeight;
         } else {
           // Screen's full: shift everything already shown up by one row
           // rather than growing cursorY past the border. scroll() runs its
@@ -75,7 +84,7 @@ class SpeechBubble {
           // per-character prints below — won't auto-flush to the physical
           // OLED while show()'s outer transaction is still open, hence the
           // explicit display() call.
-          display_->scroll(0, -kLineHeight);
+          display_->scroll(0, -lineHeight);
           display_->display();
         }
       }
@@ -163,7 +172,8 @@ class SpeechBubble {
 
  private:
   static constexpr int kMargin = 7;  // +2px over the old 5px inset from the border
-  static constexpr int kLineHeight = 10;
+  // Row pitch at textSize_ == 1; show() scales this by textSize_ for "Large".
+  static constexpr int kBaseLineHeight = 10;
   static constexpr int kBarHeight = 2;
   static constexpr int kBarMargin = 2;  // gap above the bottom border stroke
   static constexpr int kQueueDotSize = 3;
@@ -206,4 +216,5 @@ class SpeechBubble {
 
   M5GFX *display_;
   std::function<void()> onChar_;
+  uint8_t textSize_ = 1;  // see setTextSize()
 };

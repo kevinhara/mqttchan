@@ -14,6 +14,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <string.h>
+#include <time.h>
 #include <deque>
 #include <utility>
 
@@ -52,6 +53,13 @@ class MqttLink {
         mqtt_(wifiClient_) {
     self_ = this;
   }
+
+  // Must be called before begin() - connectWiFi() reads deviceName_ to set
+  // the WiFi hostname, and that has to happen ahead of WiFi.begin() to take
+  // effect (see connectWiFi()). Also callable later (e.g. after a BLE config
+  // write renames the device) - the new name takes effect on the next
+  // reconnect, same as reconfigure()'s ssid/host/etc. changes.
+  void setDeviceName(const String &name) { deviceName_ = name; }
 
   void begin(const String &ssid, const String &pass, const String &host,
              uint16_t port, const String &topic) {
@@ -118,6 +126,7 @@ class MqttLink {
     }
     mqtt_.loop();
     drainQueue();
+    applyRestingExpression();
     if (replayRequested_) {
       // Set by onButtonClick() rather than calling display() directly from
       // there - see the correction in onButtonClick()'s comment for why that
@@ -261,7 +270,7 @@ class MqttLink {
     if (bubble_ == nullptr) return;
     String text = String("MQTT ") + host_ + ":" + port_ + " - " +
                   (mqtt_.connected() ? "online" : "offline") + " | " +
-                  kHostname + " " + WiFi.localIP().toString() + " | BLE " +
+                  deviceName_ + " " + WiFi.localIP().toString() + " | BLE " +
                   bleName + " " + bleAddress;
     // button_->tick() pumped through both blocking calls below, same as
     // display() does for a real message - without it OneButton misses
@@ -283,9 +292,8 @@ class MqttLink {
   // Records the BLE identity for showStartupInfo() above, called once from
   // main.cpp's appTask after BleConfigService::begin() - the same point that
   // used to call showStartupInfo() directly (see the correction there).
-  // Doesn't draw anything itself. WiFi's hostname is set separately, in
-  // connectWiFi(), rather than captured here, since kHostname is this
-  // class's own constant either way.
+  // Doesn't draw anything itself. deviceName_ (WiFi hostname and self-
+  // reference text) is set separately, via setDeviceName().
   void setBleIdentity(const String &bleName, const String &bleAddress) {
     bleName_ = bleName;
     bleAddress_ = bleAddress;
@@ -294,12 +302,6 @@ class MqttLink {
  private:
   static MqttLink *self_;
   static constexpr const char *kClientId = "avatar-demo";
-  // Advertised to the router/DHCP and shown on the startup screen above, so
-  // the device is identifiable in a DHCP lease list or `ping` without first
-  // opening BLE. Set in connectWiFi(), ahead of WiFi.begin() - ESP32's
-  // WiFi.setHostname() only takes effect if called before the connection is
-  // established.
-  static constexpr const char *kHostname = "mqttchan";
   // First-boot default for holdMs_ below - see DeviceSettings::load().
   static constexpr uint32_t kDefaultMessageHoldMs = 30000;
   // Silence held after a jingle finishes and before typing's own beeps
@@ -310,7 +312,7 @@ class MqttLink {
     if (WiFi.status() == WL_CONNECTED) return;
     Serial.println("WiFi: connecting...");
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname(kHostname);  // must precede begin() to take effect
+    WiFi.setHostname(deviceName_.c_str());  // must precede begin() to take effect
     WiFi.begin(ssid_, pass_);
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
@@ -577,12 +579,49 @@ class MqttLink {
   // (see onButtonClick()).
   void revertToIdle() {
     if (bubble_ != nullptr) bubble_->clear();
-    avatar_->setExpression(m5avatar::Expression::Neutral);
-    if (clock_ != nullptr) clock_->showNow();
-    if (led_ != nullptr) led_->stop();
     messageActive_ = false;
     messageHeld_ = false;
     dismissRequested_ = false;
+    // messageActive_ must already be false here - applyRestingExpression()
+    // is a no-op while it's true - and restingIsNight_ is forced so the face
+    // actually updates even if the last resting expression (set before this
+    // message arrived) already matched today's night/day state.
+    restingIsNight_ = -1;
+    applyRestingExpression();
+    if (clock_ != nullptr) clock_->showNow();
+    if (led_ != nullptr) led_->stop();
+  }
+
+  // True between 23:00 and 07:00 local time - the window the resting face
+  // should look asleep rather than its usual Neutral. Unsynced time (see
+  // digital_clock.h's own 1970 check) reads as false: a device that hasn't
+  // finished NTP sync yet has no reliable local time to judge night from,
+  // and the boot sequence (see main.cpp's jingle/bubble text) already covers
+  // that window on its own.
+  bool isNighttime() const {
+    time_t now = time(nullptr);
+    struct tm local;
+    if (localtime_r(&now, &local) == nullptr || local.tm_year < (2024 - 1900))
+      return false;
+    return local.tm_hour >= 23 || local.tm_hour < 7;
+  }
+
+  // Keeps the avatar's resting (no message on screen) expression in sync
+  // with time of day - Sleepy overnight, Neutral otherwise - without
+  // hammering Avatar::setExpression() (which suspends the draw task, see
+  // main.cpp's core-split comment) every ~50ms tick. Only actually calls it
+  // when the night/day state has changed since the last call, tracked via
+  // restingIsNight_ (-1 = not yet applied, e.g. right after boot or a
+  // revertToIdle() reset). No-op while a message is on screen - that's
+  // avatar_'s to control, not this.
+  void applyRestingExpression() {
+    if (messageActive_) return;
+    bool night = isNighttime();
+    int8_t state = night ? 1 : 0;
+    if (state == restingIsNight_) return;
+    restingIsNight_ = state;
+    avatar_->setExpression(night ? m5avatar::Expression::Sleepy
+                                  : m5avatar::Expression::Neutral);
   }
 
   // Fake lip-sync, same noisy-envelope trick as main.cpp's demo-mode
@@ -616,6 +655,13 @@ class MqttLink {
   // bubble branch, cleared by revertToIdle(). onButtonClick() reads this to
   // decide whether a click means "dismiss" or "replay the last message".
   bool messageActive_ = false;
+  // -1/0/1 tri-state ("not yet applied"/day/night) rather than a plain bool,
+  // so applyRestingExpression() can tell "never applied" (boot, or just
+  // after revertToIdle() forces a re-check) from "already applied, and it
+  // was day" - a plain bool defaulting to false would look identical to
+  // "day" and skip the very first avatar_->setExpression() call. Read/written
+  // only from applyRestingExpression()/revertToIdle(), both on appTask.
+  int8_t restingIsNight_ = -1;
   // Set by onButtonClick() while display() is blocked inside show()/
   // holdWithCountdown(); polled by the lambdas passed to those calls (see
   // display()) so a click can cut a message short instead of waiting for it
@@ -661,6 +707,11 @@ class MqttLink {
   RgbLed *led_;
   OneButton *button_;
   Jingle *jingle_;
+
+  // WiFi hostname and self-reference text (showStartupInfo()) - set via
+  // setDeviceName() before begin(), and again whenever a BLE config write
+  // renames the device (see main.cpp's bleConfigDirty handling).
+  String deviceName_;
 
   // String, not const char*: values can now come from BLE config writes
   // (see reconfigure()), which don't outlive a caller-owned buffer the way

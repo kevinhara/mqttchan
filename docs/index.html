@@ -142,6 +142,35 @@
   }
   .save-status.ok { color: #4caf50; }
   .save-status.error { color: #e57373; }
+  details.settings-group {
+    margin-top: 0.9rem;
+    border: 1px solid #333;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  details.settings-group summary {
+    padding: 0.7rem 0.9rem;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #ccc;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    user-select: none;
+  }
+  details.settings-group summary::-webkit-details-marker { display: none; }
+  details.settings-group summary::after {
+    content: "\25B8";
+    color: #777;
+    transition: transform 0.15s ease;
+  }
+  details.settings-group[open] summary::after { transform: rotate(90deg); }
+  details.settings-group .settings-group-body {
+    padding: 0.2rem 0.9rem 0.9rem;
+    border-top: 1px solid #2a2a2a;
+  }
 </style>
 </head>
 <body>
@@ -166,9 +195,9 @@
     over HTTPS or localhost). Use MQTT mode instead, or switch browsers.
   </p>
 
-  <section>
+  <section v-if="mode !== 'bluetooth' || connected">
     <h2>Send message</h2>
-    <textarea v-model="text" placeholder="What should the avatar say?" maxlength="200"></textarea>
+    <textarea v-model="text" :placeholder="`What should ${settings.name || 'the avatar'} say?`" maxlength="200"></textarea>
     <div class="row">
       <select v-model="expression">
         <option v-for="e in expressions" :key="e" :value="e">{{ e }}</option>
@@ -192,54 +221,89 @@
     <div class="sent-log" v-if="lastSent">Last sent: {{ lastSent }}</div>
   </section>
 
-  <section>
+  <section v-if="mode !== 'bluetooth' || connected">
     <h2>Settings</h2>
     <template v-if="mode === 'bluetooth'">
       <div class="field">
-        <label>WiFi SSID</label>
-        <input v-model="settings.ssid" :disabled="!connected" />
+        <label>Device name</label>
+        <input v-model="settings.name" :disabled="!connected" placeholder="e.g. Ziggy" />
       </div>
-      <div class="field">
-        <label>WiFi password (leave blank to keep current)</label>
-        <input v-model="settings.pass" type="password" :disabled="!connected" autocomplete="new-password" />
-      </div>
-      <div class="field">
-        <label>MQTT host</label>
-        <input v-model="settings.host" :disabled="!connected" />
-      </div>
-      <div class="field">
-        <label>MQTT port</label>
-        <input v-model.number="settings.port" type="number" min="1" max="65535" :disabled="!connected" />
-      </div>
-      <div class="field">
-        <label>MQTT topic</label>
-        <input v-model="settings.topic" :disabled="!connected" />
-      </div>
-      <div class="field">
-        <label>Timezone</label>
-        <select v-model="settings.tz" :disabled="!connected">
-          <option v-if="!settings.tz" value="" disabled>(not set)</option>
-          <option v-for="p in tzOptions" :key="p.tz" :value="p.tz">{{ p.label }}</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Message display time: {{ settings.holdSeconds }}s</label>
-        <input type="range" min="1" max="60" step="1" v-model.number="settings.holdSeconds"
-               :disabled="!connected || settings.keepLastMessage" />
-      </div>
-      <div class="field checkbox-field">
-        <label>
-          <input type="checkbox" v-model="settings.keepLastMessage" :disabled="!connected" />
-          Keep the last message on the screen (don't revert to the clock)
-        </label>
-      </div>
+
+      <details class="settings-group">
+        <summary>Messaging</summary>
+        <div class="settings-group-body">
+          <div class="field">
+            <label>Message display time: {{ settings.holdSeconds }}s</label>
+            <input type="range" min="1" max="60" step="1" v-model.number="settings.holdSeconds"
+                   :disabled="!connected || settings.keepLastMessage" />
+          </div>
+          <div class="field checkbox-field">
+            <label>
+              <input type="checkbox" v-model="settings.keepLastMessage" :disabled="!connected" />
+              Keep the last message on the screen (don't revert to the clock)
+            </label>
+          </div>
+          <div class="field">
+            <label>Message text size</label>
+            <select v-model.number="settings.textSize" :disabled="!connected">
+              <option v-for="s in textSizes" :key="s.value" :value="s.value">{{ s.label }}</option>
+            </select>
+          </div>
+        </div>
+      </details>
+
+      <details class="settings-group">
+        <summary>WiFi</summary>
+        <div class="settings-group-body">
+          <div class="field">
+            <label>WiFi SSID</label>
+            <input v-model="settings.ssid" :disabled="!connected" />
+          </div>
+          <div class="field">
+            <label>WiFi password (leave blank to keep current)</label>
+            <input v-model="settings.pass" type="password" :disabled="!connected" autocomplete="new-password" />
+          </div>
+        </div>
+      </details>
+
+      <details class="settings-group">
+        <summary>MQTT</summary>
+        <div class="settings-group-body">
+          <div class="field">
+            <label>MQTT host</label>
+            <input v-model="settings.host" :disabled="!connected" />
+          </div>
+          <div class="field">
+            <label>MQTT port</label>
+            <input v-model.number="settings.port" type="number" min="1" max="65535" :disabled="!connected" />
+          </div>
+          <div class="field">
+            <label>MQTT topic</label>
+            <input v-model="settings.topic" :disabled="!connected" />
+          </div>
+        </div>
+      </details>
+
+      <details class="settings-group">
+        <summary>Timezone</summary>
+        <div class="settings-group-body">
+          <div class="field">
+            <label>Timezone</label>
+            <select v-model="settings.tz" :disabled="!connected">
+              <option v-if="!settings.tz" value="" disabled>(not set)</option>
+              <option v-for="p in tzOptions" :key="p.tz" :value="p.tz">{{ p.label }}</option>
+            </select>
+          </div>
+        </div>
+      </details>
+
       <div class="row">
         <button :disabled="!connected || saving" @click="saveSettings">{{ saving ? "Saving…" : "Save settings" }}</button>
       </div>
       <div class="save-status" :class="saveStatusClass">{{ saveStatusText }}</div>
     </template>
     <p class="hint" v-else>
-      Device settings (WiFi, MQTT server, topic) are read/written over Bluetooth only —
+      Device settings (name, WiFi, MQTT server, topic) are read/written over Bluetooth only —
       switch to Bluetooth mode and connect to the device to change them.
     </p>
   </section>
@@ -265,6 +329,14 @@ const LED_COLORS = [
   { value: "green", label: "Green" },
   { value: "blue", label: "Blue" },
   { value: "cycle", label: "Cycle" },
+];
+
+// Matches SpeechBubble::setTextSize() in include/speech_bubble.h - 1 is the
+// original small GLCD size (the long-standing default), 2 doubles both
+// glyph dimensions.
+const TEXT_SIZES = [
+  { value: 1, label: "Small (default)" },
+  { value: 2, label: "Large" },
 ];
 
 // Matches MqttLink::jingleFromString() in include/mqtt_link.h - "" (sent as
@@ -319,8 +391,8 @@ createApp({
     // ble_config.h's ConfigReader) - it's write-only, so it always starts
     // blank and is only sent on save if the user typed something.
     const settings = reactive({
-      ssid: "", pass: "", host: "", port: 0, topic: "",
-      tz: "", holdSeconds: 30, keepLastMessage: false,
+      name: "", ssid: "", pass: "", host: "", port: 0, topic: "",
+      tz: "", holdSeconds: 30, keepLastMessage: false, textSize: 1,
     });
     const saving = ref(false);
     const saveStatusText = ref("");
@@ -439,6 +511,7 @@ createApp({
     async function readSettingsFromDevice() {
       const value = await bleConfigChar.readValue();
       const doc = JSON.parse(new TextDecoder().decode(value));
+      settings.name = doc.name ?? "";
       settings.ssid = doc.ssid ?? "";
       settings.host = doc.host ?? "";
       settings.port = doc.port ?? 0;
@@ -446,6 +519,7 @@ createApp({
       settings.tz = doc.tz ?? "";
       settings.holdSeconds = doc.holdSeconds ?? 30;
       settings.keepLastMessage = doc.keepLast ?? false;
+      settings.textSize = doc.textSize ?? 1;
       settings.pass = "";
     }
 
@@ -469,6 +543,7 @@ createApp({
       // fields with something in them so an untouched/blank field (notably
       // pass) doesn't overwrite what's already saved on the device.
       const doc = {};
+      if (settings.name) doc.name = settings.name;
       if (settings.ssid) doc.ssid = settings.ssid;
       if (settings.pass) doc.pass = settings.pass;
       if (settings.host) doc.host = settings.host;
@@ -480,6 +555,7 @@ createApp({
       // them rather than gating on truthiness - false/0 are valid choices.
       doc.holdSeconds = settings.holdSeconds;
       doc.keepLast = settings.keepLastMessage;
+      doc.textSize = settings.textSize;
 
       saving.value = true;
       saveStatusText.value = "";
@@ -539,7 +615,7 @@ createApp({
       connected, connecting, statusText, statusClass, deviceStatus,
       connect, disconnect,
       text, expression, expressions: EXPRESSIONS, led, ledBlink, ledColors: LED_COLORS,
-      jingle, jingles: JINGLES, lastSent, send,
+      jingle, jingles: JINGLES, lastSent, send, textSizes: TEXT_SIZES,
       settings, saving, saveStatusText, saveStatusClass, saveSettings,
       tzOptions,
     };

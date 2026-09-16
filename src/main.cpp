@@ -219,6 +219,13 @@ static RgbLed rgbLed(RGB_R_PIN, RGB_G_PIN, RGB_B_PIN);
 // MqttLink::display(), before that message's own typing beeps start.
 static Jingle jingle(PIEZO_PIN);
 
+// Loaded in setup(), ahead of the boot POST screen, so its NVS-backed values
+// (see device_settings.h) are available for boot::begin() to show - well
+// before appTask (which used to be the one loading this) even starts. Global
+// rather than local to appTask for that reason; appTask just reads it.
+static constexpr const char *kDefaultDeviceName = "mqttchan";
+static DeviceSettings settings;
+
 // tone() is non-blocking (LEDC-driven), so this is safe to call from inside
 // SpeechBubble::show()'s per-character reveal loop without slowing it down.
 static void beepChar() { tone(PIEZO_PIN, 1800, 15); }
@@ -336,14 +343,8 @@ static void appTask(void *) {
 #ifdef AVATAR_DEMO_MODE
   demoLoop();
 #else
-  // secrets.h values are only the first-boot defaults; once BLE config saves
-  // anything, NVS wins from then on (see device_settings.h). The tz/hold/
-  // keepLast defaults come from DigitalClock/this file rather than secrets.h
-  // since they aren't secrets, just first-boot behavior.
-  static DeviceSettings settings;
-  settings.load(WIFI_SSID, WIFI_PASS, MQTT_HOST, MQTT_PORT, MQTT_TOPIC,
-                DigitalClock::kDefaultTz, /*defaultMessageHoldSeconds=*/30,
-                /*defaultKeepLastMessage=*/false);
+  // `settings` is already loaded - see setup(), which needs it ahead of this
+  // task even existing (for the boot POST screen's config lines).
 
   // Declared ahead of mqttLink below so it can be handed to MqttLink's
   // constructor - MqttLink polls it (via button.tick()) from inside its own
@@ -358,16 +359,26 @@ static void appTask(void *) {
   static MqttLink mqttLink(&avatar, bubble, kExpressionNames, kExpressions,
                             kExpressionCount, idleClock, &rgbLed, &button,
                             &jingle);
-  // Plays once, right as the blocking WiFi/MQTT connect below starts - in
-  // place of the "--:--" placeholder the bubble panel's idle clock used to
-  // show for that whole wait (digital_clock.h's draw() shows nothing at all
-  // while unsynced now, so there's no screen content to compete with this
-  // anyway). See jingle.h's playStartup() for why this is its own tune
-  // rather than one of the message-notification jingles or splash.cpp's
-  // boot theme.
+  // Bubble panel's own boot sequence: "Connecting to <ssid>" while
+  // connectWiFi() (inside begin() below) does its blocking wait, then
+  // "Fetching data" once that attempt has settled and MQTT/SNTP take over -
+  // digital_clock.h's draw() picks up that same "Fetching data" text once
+  // idleClock starts ticking below, so the panel never goes blank for the
+  // rest of the unsynced wait. Both are typed fast (20ms/char, vs. a real
+  // message's 45ms) since these are status text, not something to savor.
+  if (bubble != nullptr) {
+    bubble->show(("Connecting to " + settings.ssid).c_str(), /*charDelayMs=*/20);
+  }
+  // Plays once, right as the blocking WiFi/MQTT connect below starts. See
+  // jingle.h's playStartup() for why this is its own tune rather than one of
+  // the message-notification jingles or splash.cpp's boot theme.
   jingle.playStartup();
+  // Must precede begin(): connectWiFi() (called from begin()) reads this to
+  // set the WiFi hostname, which ESP32 only honors if set before WiFi.begin().
+  mqttLink.setDeviceName(settings.name);
   mqttLink.begin(settings.ssid, settings.pass, settings.host, settings.port,
                  settings.topic);
+  if (bubble != nullptr) bubble->show("Fetching data", /*charDelayMs=*/20);
   mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
                               settings.keepLastMessage);
   if (idleClock != nullptr) idleClock->setTimezone(settings.tz);
@@ -396,9 +407,13 @@ static void appTask(void *) {
   // as every other path that touches it.
   static volatile bool bleConfigDirty = false;
   static BleConfigService bleConfig;
-  static constexpr const char *kBleDeviceName = "MqttChan-Config";
+  // settings.name is the BLE beacon name as well as the LAN hostname and
+  // showStartupInfo()'s self-reference - see device_settings.h. A rename via
+  // BLE (doc["name"] below) re-advertises live (BleConfigService::
+  // renameDevice(), called from bleConfigDirty handling below) rather than
+  // needing a reboot.
   bleConfig.begin(
-      kBleDeviceName,
+      settings.name.c_str(),
       [](const JsonDocument &doc) {
         settings.applyAndSave(doc);
         bleConfigDirty = true;
@@ -409,6 +424,7 @@ static void appTask(void *) {
       },
       [](JsonDocument &doc) {
         // pass_ intentionally omitted from reads - write-only over BLE.
+        doc["name"] = settings.name;
         doc["ssid"] = settings.ssid;
         doc["host"] = settings.host;
         doc["port"] = settings.port;
@@ -423,7 +439,7 @@ static void appTask(void *) {
   // see the correction above showStartupInfo() for why: it now only appears
   // on demand, from a button click while idle and before any message has
   // arrived (see MqttLink::onButtonClick()).
-  mqttLink.setBleIdentity(kBleDeviceName,
+  mqttLink.setBleIdentity(settings.name,
                            NimBLEDevice::getAddress().toString().c_str());
 
   // Multifunction button (see BUTTON_PIN above, and `button`'s declaration
@@ -454,6 +470,15 @@ static void appTask(void *) {
     // why this can't happen directly on the BLE callback's thread.
     if (bleConfigDirty) {
       bleConfigDirty = false;
+      // Renaming the BLE beacon is BLE-only work (see renameDevice()'s
+      // comment), so it's fine to do this unconditionally here rather than
+      // tracking whether "name" specifically was in the write - same as
+      // reconfigure() below always re-applying ssid/host/etc. regardless of
+      // which one changed. mqttLink.setDeviceName() must precede
+      // reconfigure(): reconfigure() forces a WiFi reconnect, and
+      // connectWiFi() reads the new hostname off deviceName_ right away.
+      mqttLink.setDeviceName(settings.name);
+      bleConfig.renameDevice(settings.name);
       mqttLink.reconfigure(settings.ssid, settings.pass, settings.host,
                             settings.port, settings.topic);
       mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
@@ -533,6 +558,16 @@ void setup() {
   // this pin up happens later, alongside the real `oledText` panel init.
   pinMode(PIEZO_PIN, OUTPUT);
 
+  // Loaded here rather than in appTask (which used to do this): NVS/
+  // Preferences needs no WiFi/BLE/OLED and is safe this early, and the boot
+  // POST screen below wants these values on screen well before appTask
+  // starts. secrets.h values are only the first-boot defaults; once BLE
+  // config saves anything, NVS wins from then on (see device_settings.h).
+  settings.load(kDefaultDeviceName, WIFI_SSID, WIFI_PASS, MQTT_HOST,
+                MQTT_PORT, MQTT_TOPIC, DigitalClock::kDefaultTz,
+                /*defaultMessageHoldSeconds=*/30,
+                /*defaultKeepLastMessage=*/false);
+
   // HLI boot POST + splash intro, played once before M5Unified/LGFX claims
   // either panel — POST (scrolling console text) first, alone, then splash
   // (the flashy full-frame graphic) alone once POST is done. (Swapped
@@ -577,7 +612,9 @@ void setup() {
   // than left showing whatever garbage the SSD1306 powered on with.
   u8g2Bottom.clearBuffer();
   u8g2Bottom.sendBuffer();
-  boot::begin();
+  boot::begin(boot::Info{settings.name.c_str(), settings.ssid.c_str(),
+                         settings.host.c_str(), settings.port,
+                         settings.topic.c_str()});
   // Correction, 2026-09-16: this beep used to fire when boot::done() went
   // true, i.e. right as the self-test *finished* - modeled on the "self test
   // passed, handing off to the bootloader" chime AMI/Award BIOSes give at the
@@ -585,7 +622,10 @@ void setup() {
   // screens are actually remembered for is the one that opens the self test,
   // not the one that closes it, so it now fires the instant boot::begin()
   // returns, before boot::draw() has run even once.
-  tone(PIEZO_PIN, 2000, 150);
+  //
+  // Pitched up 2026-09-16 from 2000Hz - flat and dull for the one beep meant
+  // to announce the machine switching on.
+  tone(PIEZO_PIN, 3000, 150);
   bool bootDone = false;
   uint32_t bootDoneAt = 0;
   for (;;) {

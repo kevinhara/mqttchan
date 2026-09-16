@@ -96,6 +96,25 @@ class BleConfigService {
     if (statusChar_ != nullptr) statusChar_->setValue(status.c_str());
   }
 
+  // Re-advertises under a new device name (the GAP name plus the
+  // scan-response name set at begin()) without a reboot. Safe to call
+  // directly from onConfig_'s own NimBLE host-task thread - unlike the
+  // WiFi/MQTT/SNTP work reconfigure() triggers (see main.cpp's
+  // bleConfigDirty comment), this never touches lwIP, only the BLE stack
+  // it's already running on. Doesn't touch an already-open GATT connection;
+  // a connected client keeps working under the old name until it
+  // disconnects and rescans.
+  void renameDevice(const String &name) {
+    NimBLEDevice::setDeviceName(name.c_str());
+    NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+    advertising->setName(name.c_str());
+    // NimBLE doesn't push advertisement-data changes to an already-running
+    // advertiser - stop/start is what makes the new scan-response payload
+    // actually go out.
+    advertising->stop();
+    advertising->start();
+  }
+
  private:
   static constexpr const char *kServiceUuid =
       "9f2e0000-9b5f-4a2e-8b7a-9c9f6f5b1a10";

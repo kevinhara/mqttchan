@@ -10,8 +10,23 @@
 
 namespace boot {
 
+// Live device/config values shown alongside the fake hardware self-test
+// lines, so the screen someone actually watches at power-on says something
+// about *this* device instead of only a period bit. Copied into internal
+// buffers at begin() time, so callers don't need to keep the sources (e.g. a
+// DeviceSettings) alive past that call. A null or empty field prints as
+// "(not set)" rather than being skipped, so the row count - and the timing
+// script beneath it - never changes with configuration state.
+struct Info {
+  const char* name;   // device name; DeviceSettings always has one
+  const char* ssid;   // WiFi SSID
+  const char* host;   // MQTT broker host
+  uint16_t    port;   // MQTT broker port; ignored if host is empty
+  const char* topic;  // MQTT topic
+};
+
 // Start (or restart) the sequence from its first frame.
-void begin();
+void begin(const Info& info);
 
 // True once the last line has printed and the hand-off cursor has blinked out.
 bool done();

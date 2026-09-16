@@ -9,6 +9,7 @@
 #include <Preferences.h>
 
 struct DeviceSettings {
+  String name;  // affectionate device name - BLE beacon, LAN hostname, self-references
   String ssid;
   String pass;
   String host;
@@ -17,13 +18,17 @@ struct DeviceSettings {
   String tz;                    // POSIX TZ string, e.g. DigitalClock::kDefaultTz
   uint16_t messageHoldSeconds;  // see MqttLink::setDisplayOptions()
   bool keepLastMessage;         // see MqttLink::setDisplayOptions()
+  uint8_t messageTextSize;      // see SpeechBubble::setTextSize() - 1 (Small,
+                                 // the original/default GLCD size) or 2 (Large)
 
-  void load(const char *defaultSsid, const char *defaultPass,
-            const char *defaultHost, uint16_t defaultPort,
-            const char *defaultTopic, const char *defaultTz,
-            uint16_t defaultMessageHoldSeconds, bool defaultKeepLastMessage) {
+  void load(const char *defaultName, const char *defaultSsid,
+            const char *defaultPass, const char *defaultHost,
+            uint16_t defaultPort, const char *defaultTopic,
+            const char *defaultTz, uint16_t defaultMessageHoldSeconds,
+            bool defaultKeepLastMessage, uint8_t defaultMessageTextSize) {
     Preferences prefs;
     prefs.begin(kNamespace, /*readOnly=*/true);
+    name = prefs.getString("name", defaultName);
     ssid = prefs.getString("ssid", defaultSsid);
     pass = prefs.getString("pass", defaultPass);
     host = prefs.getString("host", defaultHost);
@@ -33,6 +38,7 @@ struct DeviceSettings {
     messageHoldSeconds =
         prefs.getUShort("holdSeconds", defaultMessageHoldSeconds);
     keepLastMessage = prefs.getBool("keepLast", defaultKeepLastMessage);
+    messageTextSize = prefs.getUChar("textSize", defaultMessageTextSize);
     prefs.end();
   }
 
@@ -42,6 +48,10 @@ struct DeviceSettings {
   void applyAndSave(const JsonDocument &doc) {
     Preferences prefs;
     prefs.begin(kNamespace, /*readOnly=*/false);
+    if (doc["name"].is<const char *>()) {
+      name = doc["name"].as<const char *>();
+      prefs.putString("name", name);
+    }
     if (doc["ssid"].is<const char *>()) {
       ssid = doc["ssid"].as<const char *>();
       prefs.putString("ssid", ssid);
@@ -73,6 +83,10 @@ struct DeviceSettings {
     if (doc["keepLast"].is<bool>()) {
       keepLastMessage = doc["keepLast"].as<bool>();
       prefs.putBool("keepLast", keepLastMessage);
+    }
+    if (doc["textSize"].is<uint8_t>()) {
+      messageTextSize = doc["textSize"].as<uint8_t>();
+      prefs.putUChar("textSize", messageTextSize);
     }
     prefs.end();
   }

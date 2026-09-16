@@ -86,38 +86,73 @@ class DigitalClock {
   // runs from the last Sunday in September to the first Sunday in April.
   static constexpr const char *kTz = "NZST-12NZDT,M9.5.0,M4.1.0/3";
 
+  // Burn-in mitigation: cycles the clock's drawn position through this table
+  // once per minute (see minutesSinceMidnight below) rather than pinning it
+  // dead-centre for as long as the device stays powered on. Kept tight on X:
+  // "HH:MM" at size 4 is 120px wide on a 128px panel (see the size-4 comment
+  // below), leaving only 4px of slack per side, so a ±3 swing is as far as
+  // it can move without clipping. Y has far more room — size-4 text is 32px
+  // tall on a 64px panel, 16px slack per side — so it does most of the work.
+  static constexpr int8_t kOffsets[][2] = {
+      {0, 0},  {3, -10}, {-3, 10}, {3, 10}, {-3, -10},
+      {0, -10}, {0, 10}, {3, 0},  {-3, 0},
+  };
+  static constexpr size_t kOffsetCount =
+      sizeof(kOffsets) / sizeof(kOffsets[0]);
+
   void draw(time_t now) {
     struct tm local;
-    char buf[8];
     // configTzTime() resets the clock to the epoch until SNTP's first sync
     // lands; localtime_r "succeeding" on that just yields 1970. Anything
     // before this file was written can only mean "not synced yet".
     bool synced =
         localtime_r(&now, &local) != nullptr && local.tm_year >= (2024 - 1900);
 
+    if (!synced) {
+      // Correction, 2026-09-16: this used to fall back to a "--:--"
+      // placeholder while unsynced (see git history), which read as a
+      // stuck/broken clock rather than a device still booting. Then changed
+      // to a blank screen, then to redrawing "Fetching data" itself here so
+      // the panel never goes blank for the rest of a long unsynced wait
+      // (MQTT retries, a slow broker, NTP taking its time). That redraw was
+      // its own bug: main.cpp's appTask already types that same "Fetching
+      // data" onto the bubble, in its bordered, word-wrapped box, right
+      // before idleClock starts ticking - this fillScreen+drawString ran on
+      // idleClock's very next tick (within ~50ms) and stomped that box with
+      // an unboxed, dead-centered copy, which read as a jarring flash into a
+      // larger, cut-off-looking font even though the point size hadn't
+      // actually changed. Since the text is identical either way, simplest
+      // fix is to just leave the panel alone while unsynced - the bubble's
+      // own text is already correct and stays up untouched for as long as
+      // sync takes.
+      return;
+    }
+
+    // A pure function of the current hour/minute, not separately tracked
+    // state — it only changes when the minute does, since local.tm_min only
+    // changes once a minute, and tick() already guards against redrawing
+    // more than once a second.
+    int minutesSinceMidnight = local.tm_hour * 60 + local.tm_min;
+    int8_t dx = kOffsets[minutesSinceMidnight % kOffsetCount][0];
+    int8_t dy = kOffsets[minutesSinceMidnight % kOffsetCount][1];
+
+    char buf[8];
+    strftime(buf, sizeof(buf), "%H:%M", &local);
+    // Blink the colon at 1Hz rather than leaving it solid — draw() only
+    // runs once a second (see tick()), so every call is one blink
+    // half-cycle.
+    colonOn_ = !colonOn_;
+    if (!colonOn_) buf[2] = ' ';
+
     display_->startWrite();
     display_->fillScreen(TFT_BLACK);
-    if (synced) {
-      strftime(buf, sizeof(buf), "%H:%M", &local);
-      // Blink the colon at 1Hz rather than leaving it solid — draw() only
-      // runs once a second (see tick()), so every call is one blink
-      // half-cycle.
-      colonOn_ = !colonOn_;
-      if (!colonOn_) buf[2] = ' ';
-
-      display_->setTextColor(TFT_WHITE, TFT_BLACK);
-      // Size 4 is as large as "HH:MM" fits on a 128px-wide panel (5 chars *
-      // 6px * 4 = 120px) — any bigger and it clips off the sides.
-      display_->setTextSize(4);
-      display_->setTextDatum(textdatum_t::middle_center);
-      display_->drawString(buf, display_->width() / 2, display_->height() / 2);
-    }
-    // Correction, 2026-09-16: this used to fall back to a "--:--" placeholder
-    // while unsynced (see git history) - left up the whole time WiFi/NTP were
-    // still connecting, which read as a stuck/broken clock rather than a
-    // device still booting. Blank screen instead - main.cpp now plays a
-    // startup jingle for that wait (see jingle.h's playStartup()), so there's
-    // nothing this panel needs to say while it has no real time to show.
+    display_->setTextColor(TFT_WHITE, TFT_BLACK);
+    // Size 4 is as large as "HH:MM" fits on a 128px-wide panel (5 chars *
+    // 6px * 4 = 120px) — any bigger and it clips off the sides.
+    display_->setTextSize(4);
+    display_->setTextDatum(textdatum_t::middle_center);
+    display_->drawString(buf, display_->width() / 2 + dx,
+                          display_->height() / 2 + dy);
     display_->endWrite();
   }
 

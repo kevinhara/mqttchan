@@ -182,6 +182,15 @@ confirmed the rounded-rect border draws correctly and word-wrap works: short
 phrases ("Great to see you!") render on one line, and the longest phrase
 ("Feeling kind of blue.") correctly wraps to two lines without overlap.
 
+**Message text size is configurable** (`SpeechBubble::setTextSize()`,
+persisted as `DeviceSettings::messageTextSize`/`textSize` over BLE): "Small"
+(the original size, value `1`) is the default, "Large" (value `2`) doubles
+both glyph dimensions. Changeable from the control page's Messaging settings
+group (`docs/index.html`) same as message hold time/keep-last-message; takes
+effect on the next message shown, not retroactively on whatever's already on
+screen. Not yet verified live — build-verified only so far, unlike the rest
+of this section.
+
 ## How it was made to work on a non-M5 panel
 
 Two problems had to be solved; both are worth knowing before editing this.
@@ -502,9 +511,10 @@ A few sharp edges worth knowing if this stops working:
 - The board publishes `avatar/status` (`"online"`/`"offline"` via MQTT LWT,
   retained) so anything watching can tell if it's actually up.
 - **`MqttLink::showStartupInfo()`'s bubble message** reports MQTT
-  host/port/status, WiFi hostname (`mqttchan`, set via `WiFi.setHostname()`
-  in `connectWiFi()` — ahead of `WiFi.begin()`, since ESP32 only honors it if
-  set before the connection is made) + IP, and the BLE device name/address.
+  host/port/status, the device name (`deviceName_`, doubling as the WiFi
+  hostname — set via `WiFi.setHostname()` in `connectWiFi()`, ahead of
+  `WiFi.begin()`, since ESP32 only honors it if set before the connection is
+  made) + IP, and the BLE device name/address.
   **Correction, 2026-09-16:** this used to show automatically, once, right
   after `appTask` connects — added 2026-09-15 so that was readable off the
   panel without a laptop. Changed so it no longer appears on boot at all: a
@@ -530,6 +540,28 @@ A few sharp edges worth knowing if this stops working:
   partition** (vs 46% in demo mode) once WiFi + PubSubClient + ArduinoJson are
   linked in — still fits, but there isn't a lot of headroom left for more
   libraries without moving to a bigger partition scheme.
+- **The device has an affectionate "device name"** (`DeviceSettings::name`,
+  default `mqttchan`, editable from the control page's Settings panel — see
+  `docs/index.html`), not just a secrets.h-configured hostname. It's used as
+  the WiFi hostname, the BLE beacon name/GAP name, and the self-reference
+  text in `showStartupInfo()` above. WiFi hostname changes take effect on the
+  next reconnect, same as any other BLE-written setting (`reconfigure()`
+  forces one). The BLE name is different: `BleConfigService::renameDevice()`
+  re-advertises under the new name live, without a reboot — `NimBLEDevice::
+  setDeviceName()` plus `NimBLEAdvertising::setName()` + a stop/start cycle,
+  called from `onConfig_`'s own NimBLE host-task thread since (unlike
+  WiFi/MQTT) none of that touches lwIP.
+- **The bubble panel no longer goes blank while booting.** `appTask` types
+  "Connecting to `<ssid>`" on the bubble right before the blocking
+  WiFi connect, then "Fetching data" once that attempt has settled and
+  MQTT/SNTP take over. `DigitalClock::draw()`'s unsynced branch (in
+  `digital_clock.h`) picks up that same "Fetching data" text once
+  `idleClock` starts ticking, so the panel stays on message instead of
+  blanking for however long SNTP/MQTT actually take. **Correction,
+  2026-09-16:** an earlier version of this file said the
+  unsynced clock panel should stay blank because the startup jingle already
+  covers the wait — that only holds for the jingle's few seconds, not for a
+  slow broker or NTP server, so the blank fallback is gone.
 
 **Headless bench test, no broker needed:** build with `-DAVATAR_FB_DUMP` and
 `appTask` injects one synthetic payload straight into the parse-and-display
