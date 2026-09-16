@@ -359,6 +359,15 @@ static void appTask(void *) {
   static MqttLink mqttLink(&avatar, bubble, kExpressionNames, kExpressions,
                             kExpressionCount, idleClock, &rgbLed, &button,
                             &jingle);
+  // Plays once, right as appTask starts up, before the bubble panel shows
+  // anything - see jingle.h's playStartup() for why this is its own tune
+  // rather than one of the message-notification jingles or splash.cpp's boot
+  // theme. The 1s delay after it finishes (playStartup() itself blocks for
+  // the tune's ~700ms) gives the jingle a clear moment on its own before the
+  // "Connecting to <ssid>" bubble starts typing, rather than the two
+  // happening on top of each other.
+  jingle.playStartup();
+  vTaskDelay(pdMS_TO_TICKS(1000));
   // Bubble panel's own boot sequence: "Connecting to <ssid>" while
   // connectWiFi() (inside begin() below) does its blocking wait, then
   // "Fetching data" once that attempt has settled and MQTT/SNTP take over -
@@ -369,10 +378,6 @@ static void appTask(void *) {
   if (bubble != nullptr) {
     bubble->show(("Connecting to " + settings.ssid).c_str(), /*charDelayMs=*/20);
   }
-  // Plays once, right as the blocking WiFi/MQTT connect below starts. See
-  // jingle.h's playStartup() for why this is its own tune rather than one of
-  // the message-notification jingles or splash.cpp's boot theme.
-  jingle.playStartup();
   // Must precede begin(): connectWiFi() (called from begin()) reads this to
   // set the WiFi hostname, which ESP32 only honors if set before WiFi.begin().
   mqttLink.setDeviceName(settings.name);
@@ -566,7 +571,8 @@ void setup() {
   settings.load(kDefaultDeviceName, WIFI_SSID, WIFI_PASS, MQTT_HOST,
                 MQTT_PORT, MQTT_TOPIC, DigitalClock::kDefaultTz,
                 /*defaultMessageHoldSeconds=*/30,
-                /*defaultKeepLastMessage=*/false);
+                /*defaultKeepLastMessage=*/false,
+                /*defaultMessageTextSize=*/1);
 
   // HLI boot POST + splash intro, played once before M5Unified/LGFX claims
   // either panel — POST (scrolling console text) first, alone, then splash
