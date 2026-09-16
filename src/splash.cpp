@@ -444,26 +444,47 @@ static void drawKicker(U8G2& g, uint32_t el) {
 }
 
 // ---------------------------------------------------------------- the theme
-// A monophonic synthwave arpeggio on the piezo, timed to the same beats the
-// visuals hit — the "retro cassette" half of the brief. The visuals alone
-// were already outrun/synthwave (the sun, the grid, the neon skyline);
-// brand.h's "Cassette Bus" joke and KICK_HISS's tape-static burst above
-// already lean the same way, and this is what makes the intro read as a
-// tape playing, not just a screen lighting up.
+// A monophonic riff on the piezo, timed to the same beats the visuals hit —
+// the "retro cassette" half of the brief. The visuals alone were already
+// outrun/synthwave (the sun, the grid, the neon skyline); brand.h's
+// "Cassette Bus" joke and KICK_HISS's tape-static burst above already lean
+// the same way, and this is what makes the intro read as a tape playing,
+// not just a screen lighting up.
+//
+// The scale itself, though, is the one place the intro can nod at the mark
+// rather than the decade: 原 is a kanji, and a Western minor pentatonic
+// under it read as generic synthwave with no connection to what just landed
+// on screen. Swapped for Hirajoshi (see SCALE below), it reads as a koto/
+// shamisen line instead — distinct, deliberate, and confident rather than
+// borrowed. "Confident" is also why the beats below no longer open on a shy
+// rising phrase or close on the scale's top note: STAGE_BUILD opens on a
+// taiko-style root/fifth pulse and STAGE_SLAM lands on a low, held root
+// instead of a shrill high one — the intro announces itself instead of
+// tiptoeing in.
 //
 // One passive piezo holds one note at a time, so this is a riff, not a
-// chord progression: a slow rising phrase while the world assembles, a
-// driving arpeggio through the approach that quickens toward the slam (the
-// same acceleration gridPhase() gives the floor, just heard instead of
-// seen), a hit on the slam, and two resolving notes as the mark and kicker
+// chord progression: the taiko pulse while the world assembles, a driving
+// arpeggio through the approach that quickens toward the slam (the same
+// acceleration gridPhase() gives the floor, just heard instead of seen), a
+// grounded hit on the slam, and two resolving notes as the mark and kicker
 // land. ThemeStage/themeStage/themeNextMs/themeBeat are declared up near
 // startMs/started, not here - see the comment there.
 
-// A minor pentatonic — the classic driving-synthwave set. Nothing in it
-// clashes regardless of what order it plays in, so the pattern below can
-// just walk it without needing real harmony.
-static const uint16_t SCALE[]  = {220, 262, 294, 330, 392, 440, 523, 587};
+// Hirajoshi, a traditional Japanese pentatonic — root, +2, +3, +7, +8
+// semitones, spanning two octaves here (A3..F5). The half-steps at B-C and
+// E-F are what give it that koto/shamisen character instead of the sound of
+// a Western scale played slowly; a true minor pentatonic (root+2+3+5+7, no
+// half-steps at all) was tried first and just sounded like generic rock.
+// E (index FIFTH, +7 semitones) is the one interval this shares with a
+// power chord, and the riff below leans on it for the "driving" beats.
+static const uint16_t SCALE[]  = {220, 247, 262, 330, 349, 440, 494, 523, 659, 698};
 static const int      SCALE_N  = sizeof(SCALE) / sizeof(SCALE[0]);
+static const int      ROOT     = 0;  // index of the tonic — the notes STAGE_BUILD/SLAM/KICK anchor on
+static const int      FIFTH    = 3;  // index of E, the true 5th — the "driving" interval in the riff
+// An octave below ROOT, reserved for the slam: SCALE[ROOT] alone read as a
+// beat, not an impact, next to a full-frame flash. Lower still and a piezo
+// stops reproducing it audibly, so this is as deep as the hit can go.
+static const uint16_t BOOM = 110;
 
 // ms until the next approach beat: ramps from a loping 220ms down to a
 // driving 90ms by the slam, so the ear speeds up together with gridPhase()'s
@@ -477,12 +498,14 @@ void playTheme(uint8_t piezoPin) {
   uint32_t el = elapsed();
   while (themeStage != STAGE_DONE && themeNextMs <= el) {
     switch (themeStage) {
-      case STAGE_BUILD:  // the world assembling: a slow rising phrase
-        tone(piezoPin, SCALE[themeBeat % 4], 90);
+      case STAGE_BUILD: {  // the world assembling: a taiko-style root/fifth pulse
+        static const uint8_t PULSE[] = {ROOT, ROOT, FIFTH, ROOT};
+        tone(piezoPin, SCALE[PULSE[themeBeat % 4]], 110);
         themeBeat++;
         themeNextMs += 220;
         if (themeNextMs >= T_APPROACH) themeStage = STAGE_APPROACH;
         break;
+      }
 
       case STAGE_APPROACH: {  // the run: quickens toward the slam
         tone(piezoPin, SCALE[themeBeat % SCALE_N], 60);
@@ -496,20 +519,20 @@ void playTheme(uint8_t piezoPin) {
         break;
       }
 
-      case STAGE_SLAM:  // the full-frame XOR hit
-        tone(piezoPin, SCALE[SCALE_N - 1], 90);
+      case STAGE_SLAM:  // the full-frame XOR hit — a grounded boom, not a shrill top note
+        tone(piezoPin, BOOM, 140);
         themeNextMs = T_MARK;
         themeStage  = STAGE_MARK;
         break;
 
-      case STAGE_MARK:  // 原 lands
-        tone(piezoPin, SCALE[2], 200);
+      case STAGE_MARK:  // 原 lands — the octave above root, bright but still anchored
+        tone(piezoPin, SCALE[ROOT + 5], 200);
         themeNextMs = T_KICK;
         themeStage  = STAGE_KICK;
         break;
 
-      case STAGE_KICK:  // the strap line reveals — resolve and stop
-        tone(piezoPin, SCALE[0], 250);
+      case STAGE_KICK:  // the strap line reveals — resolve to a held root and stop
+        tone(piezoPin, SCALE[ROOT], 300);
         themeStage = STAGE_DONE;
         break;
 

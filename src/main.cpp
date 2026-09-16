@@ -21,6 +21,7 @@
 #include <Avatar.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <OneButton.h>
 
 #include "ssd1306_display.h"
 #include "small_oled_face.h"
@@ -32,6 +33,8 @@
 #include "secrets.h"
 #include "boot.h"
 #include "splash.h"
+#include "rgb_led.h"
+#include "jingle.h"
 
 // SSD1306 on SDA=GPIO4, SCL=GPIO15, address 0x3C.
 // SDA is on GPIO4 rather than the more usual GPIO2 because GPIO2 is a
@@ -60,6 +63,83 @@
 // SpeechBubble's onChar hook). GPIO27 avoids both OLEDs' pins above, the
 // boot-strapping pins (0/2/5/12), and the flash pins (6-11).
 #define PIEZO_PIN 27
+
+// 4-pin RGB LED (common-cathode assumed: common leg to GND, each color leg
+// through its own current-limiting resistor to the GPIO below). Board is a
+// 30-pin ESP32 devkit with no GPIO16/17 broken out, so these three were
+// picked instead — all LEDC-PWM-capable, clear of the OLED buses (4/15,
+// 32/33), the piezo (27), the boot-strap pins (0/2/5/12), and M5Unified's
+// reserved PortA pins (21/22). If the LED turns out to be common-anode
+// instead (common leg to 3.3V), define RGB_COMMON_ANODE below to invert the
+// PWM duty cycle rather than rewiring.
+#define RGB_R_PIN 25
+#define RGB_G_PIN 26
+#define RGB_B_PIN 14
+// #define RGB_COMMON_ANODE
+
+// Multifunction push button. 4-leg tactile switches like this are a single
+// SPST contact, not four independent ones, but which two legs are already
+// shorted together inside the case (and so must be avoided as a pair) varies
+// by part - don't assume a layout, check it with a multimeter.
+//
+// Correction, 2026-09-16: this used to claim the shorted pairs are always
+// "diagonally opposite" corners, on the assumption that the two legs on a
+// given side are permanently tied together and only the diagonal picks work
+// as a switch. That's wrong for the switch actually on this board - a
+// continuity check across the two same-side legs wired here (GPIO13 leg and
+// GND leg) read open at rest and closed on press, i.e. a working switch
+// contact, which the "same side is always shorted" assumption said should
+// be impossible. Verified live 2026-09-16 by the wiring in place: pin reads
+// HIGH released, LOW pressed, matching OneButton's activeLow=true below.
+// OneButton (see platformio.ini) enables the internal pull-up, so the pin
+// reads HIGH released and LOW pressed. GPIO13 avoids the OLED buses (4/15,
+// 32/33), the piezo (27), the RGB LED (14/25/26), the boot-strapping pins
+// (0/2/5/12), and the flash pins (6-11).
+#define BUTTON_PIN 13
+
+#ifdef RGB_LED_TEST
+// Bench-only wiring test, built with `-D RGB_LED_TEST` (see platformio.ini)
+// instead of the real app — same pattern as AVATAR_DEMO_MODE/AVATAR_FB_DUMP
+// below, but standalone at setup()/loop() rather than inside appTask, since
+// this needs no OLEDs/WiFi/MQTT and is meant to run before any of that is
+// wired up. Remove the flag and reflash to go back to the real app.
+static constexpr uint32_t kRgbPwmFreq = 5000;
+static constexpr uint8_t kRgbPwmRes = 8;  // 8-bit duty: 0-255
+
+static void rgbSetColor(uint8_t r, uint8_t g, uint8_t b) {
+#ifdef RGB_COMMON_ANODE
+  r = 255 - r;
+  g = 255 - g;
+  b = 255 - b;
+#endif
+  ledcWrite(RGB_R_PIN, r);
+  ledcWrite(RGB_G_PIN, g);
+  ledcWrite(RGB_B_PIN, b);
+}
+
+// Standard HSV(h in [0,360), s=v=1) -> RGB, for the spectrum sweep below.
+static void hsvToRgb(float h, uint8_t &r, uint8_t &g, uint8_t &b) {
+  float c = 255.0f;
+  float x = c * (1 - fabsf(fmodf(h / 60.0f, 2) - 1));
+  float rp = 0, gp = 0, bp = 0;
+  if (h < 60) {
+    rp = c; gp = x;
+  } else if (h < 120) {
+    rp = x; gp = c;
+  } else if (h < 180) {
+    gp = c; bp = x;
+  } else if (h < 240) {
+    gp = x; bp = c;
+  } else if (h < 300) {
+    rp = x; bp = c;
+  } else {
+    rp = c; bp = x;
+  }
+  r = (uint8_t)rp;
+  g = (uint8_t)gp;
+  b = (uint8_t)bp;
+}
+#endif  // RGB_LED_TEST
 
 // Swapped 2026-09-15: the two physical OLED panels turned out to be mounted
 // reversed relative to their wiring, so `oled` (the avatar/face panel) and
@@ -127,6 +207,17 @@ static SpeechBubble *bubble = nullptr;
 // Named idleClock, not clock: that shadows <time.h>'s clock() at global scope
 // and fails to compile.
 static DigitalClock *idleClock = nullptr;
+// Real (non-RGB_LED_TEST) app's RGB status LED, on the same three pins the
+// bench test above uses. begin() is called from the real setup() below;
+// MqttLink is handed a pointer to this so it can light it for as long as a
+// message is on screen (see mqtt_link.h's display()/rgb_led.h's start()).
+static RgbLed rgbLed(RGB_R_PIN, RGB_G_PIN, RGB_B_PIN);
+// Plays a short notification tune, picked per-message the same way LED color
+// is (see mqtt_link.h's display()/jingle.h's Jingle::play()). Shares
+// PIEZO_PIN with beepChar() below and splash's boot theme - never contends
+// with either, since it only ever plays synchronously from inside
+// MqttLink::display(), before that message's own typing beeps start.
+static Jingle jingle(PIEZO_PIN);
 
 // tone() is non-blocking (LEDC-driven), so this is safe to call from inside
 // SpeechBubble::show()'s per-character reveal loop without slowing it down.
@@ -254,8 +345,27 @@ static void appTask(void *) {
                 DigitalClock::kDefaultTz, /*defaultMessageHoldSeconds=*/30,
                 /*defaultKeepLastMessage=*/false);
 
+  // Declared ahead of mqttLink below so it can be handed to MqttLink's
+  // constructor - MqttLink polls it (via button.tick()) from inside its own
+  // blocking show()/holdWithCountdown() calls, so a click can dismiss a
+  // message that's still typing or counting down rather than only one
+  // that's already finished. attachClick()/attachDoubleClick()/
+  // attachLongPressStart() below still run after mqttLink exists, same as
+  // before - only the declaration moved up.
+  static OneButton button(BUTTON_PIN, /*activeLow=*/true,
+                           /*pullupActive=*/true);
+
   static MqttLink mqttLink(&avatar, bubble, kExpressionNames, kExpressions,
-                            kExpressionCount, idleClock);
+                            kExpressionCount, idleClock, &rgbLed, &button,
+                            &jingle);
+  // Plays once, right as the blocking WiFi/MQTT connect below starts - in
+  // place of the "--:--" placeholder the bubble panel's idle clock used to
+  // show for that whole wait (digital_clock.h's draw() shows nothing at all
+  // while unsynced now, so there's no screen content to compete with this
+  // anyway). See jingle.h's playStartup() for why this is its own tune
+  // rather than one of the message-notification jingles or splash.cpp's
+  // boot theme.
+  jingle.playStartup();
   mqttLink.begin(settings.ssid, settings.pass, settings.host, settings.port,
                  settings.topic);
   mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
@@ -265,9 +375,9 @@ static void appTask(void *) {
   // BLE config: a phone (nRF Connect, LightBlue, ...) can connect, read/write
   // WiFi+MQTT+display settings, and push a one-off test message through the
   // same {"text":...,"expression":...} JSON path MQTT uses — see
-  // ble_config.h. Started ahead of showStartupInfo() below (moved up from
-  // after it) so that screen can report the BLE identity NimBLEDevice::init()
-  // assigns, alongside the WiFi one, instead of just the MQTT one.
+  // ble_config.h. Started ahead of mqttLink.setBleIdentity() below so that
+  // call can capture the BLE identity NimBLEDevice::init() assigns, alongside
+  // the WiFi one, instead of just the MQTT one.
   //
   // onConfig_ below runs on NimBLE's own host task, not appTask (see
   // ble_config.h's file-header comment). mqttLink.reconfigure() touches
@@ -308,14 +418,24 @@ static void appTask(void *) {
         doc["keepLast"] = settings.keepLastMessage;
       });
 
-  // First thing on the bubble panel: host/port + online status, hostname/IP,
-  // and BLE name/address, so a glance confirms everything this device is
-  // reachable through without needing a laptop. Fixed 10s hold, independent
-  // of settings.messageHoldSeconds - see showStartupInfo(). Safe to call
-  // here, ahead of the appTask loop below that starts servicing the message
-  // queue.
-  mqttLink.showStartupInfo(kBleDeviceName,
-                            NimBLEDevice::getAddress().toString().c_str());
+  // Records the BLE identity for the "what am I connected to" summary
+  // (MqttLink::showStartupInfo()) rather than showing it here automatically -
+  // see the correction above showStartupInfo() for why: it now only appears
+  // on demand, from a button click while idle and before any message has
+  // arrived (see MqttLink::onButtonClick()).
+  mqttLink.setBleIdentity(kBleDeviceName,
+                           NimBLEDevice::getAddress().toString().c_str());
+
+  // Multifunction button (see BUTTON_PIN above, and `button`'s declaration
+  // near the top of this function). A single click dismisses whatever
+  // message is on screen, or replays the last one if nothing is - see
+  // MqttLink::onButtonClick(). Double-click/long-press have no action wired
+  // up yet, so those two just log for now, to confirm timing over serial
+  // before deciding what they should do.
+  button.attachClick([]() { mqttLink.onButtonClick(); });
+  button.attachDoubleClick([]() { Serial.println("Button: double-click"); });
+  button.attachLongPressStart(
+      []() { Serial.println("Button: long-press start"); });
 
 #ifdef AVATAR_FB_DUMP
   // Headless bench test: exercise the parse-and-display path with a
@@ -353,6 +473,9 @@ static void appTask(void *) {
     // a keepLastMessage_ message the moment the wall-clock second changes,
     // undoing it within about a second of it finishing typing.
     if (idleClock != nullptr && !mqttLink.isHoldingMessage()) idleClock->tick();
+    // OneButton needs frequent polling to time clicks/long-presses; the 50ms
+    // period below is well inside its default click/press timing windows.
+    button.tick();
     // Refresh the BLE status characteristic every couple seconds rather than
     // every 50ms tick - it's read-on-demand by the client, not notified.
     uint32_t now = millis();
@@ -365,6 +488,43 @@ static void appTask(void *) {
 #endif
 }
 
+#ifdef RGB_LED_TEST
+void setup() {
+  Serial.begin(115200);
+  ledcAttach(RGB_R_PIN, kRgbPwmFreq, kRgbPwmRes);
+  ledcAttach(RGB_G_PIN, kRgbPwmFreq, kRgbPwmRes);
+  ledcAttach(RGB_B_PIN, kRgbPwmFreq, kRgbPwmRes);
+}
+
+void loop() {
+  // Red, green, blue, off - confirms each channel/resistor/leg is wired to
+  // the color it's supposed to be, one at a time.
+  Serial.println("red");
+  rgbSetColor(255, 0, 0);
+  delay(700);
+  Serial.println("green");
+  rgbSetColor(0, 255, 0);
+  delay(700);
+  Serial.println("blue");
+  rgbSetColor(0, 0, 255);
+  delay(700);
+  Serial.println("off");
+  rgbSetColor(0, 0, 0);
+  delay(700);
+
+  // Then sweep the full spectrum, to confirm PWM mixing works smoothly
+  // across all three channels rather than just full-on/full-off.
+  Serial.println("spectrum sweep");
+  for (int deg = 0; deg < 360; deg++) {
+    uint8_t r, g, b;
+    hsvToRgb((float)deg, r, g, b);
+    rgbSetColor(r, g, b);
+    delay(15);
+  }
+  rgbSetColor(0, 0, 0);
+  delay(700);
+}
+#else
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -418,14 +578,19 @@ void setup() {
   u8g2Bottom.clearBuffer();
   u8g2Bottom.sendBuffer();
   boot::begin();
+  // Correction, 2026-09-16: this beep used to fire when boot::done() went
+  // true, i.e. right as the self-test *finished* - modeled on the "self test
+  // passed, handing off to the bootloader" chime AMI/Award BIOSes give at the
+  // end of POST. Moved to the very start instead: the beep these old boot
+  // screens are actually remembered for is the one that opens the self test,
+  // not the one that closes it, so it now fires the instant boot::begin()
+  // returns, before boot::draw() has run even once.
+  tone(PIEZO_PIN, 2000, 150);
   bool bootDone = false;
   uint32_t bootDoneAt = 0;
   for (;;) {
     boot::draw(u8g2Top);
-    // The single "POST passed" beep a DOS-era BIOS gives right as its self
-    // test hands off to the bootloader.
     if (!bootDone && boot::done()) {
-      tone(PIEZO_PIN, 1000, 150);
       bootDone = true;
       bootDoneAt = millis();
     }
@@ -510,12 +675,13 @@ void setup() {
     idleClock = new DigitalClock(&oledText);
     // Not idleClock->begin() here - see digital_clock.h's begin() comment
     // for why starting SNTP this early (well before WiFi.begin() ever runs)
-    // is implicated in the intermittent MQTT-connect lwIP crash. showNow()
-    // alone still draws the correct "--:--" unsynced placeholder (draw()'s
-    // tm_year check treats "never configured" the same as "not synced yet").
-    // appTask's real idleClock->setTimezone() call, after WiFi/MQTT connect,
-    // is what actually starts SNTP now.
-    idleClock->showNow();
+    // is implicated in the intermittent MQTT-connect lwIP crash. No
+    // showNow() call either - draw() now shows nothing at all while unsynced
+    // (see digital_clock.h's 2026-09-16 correction), and init() above
+    // already leaves the panel blank, so there's nothing an early call would
+    // put on screen that isn't already there. appTask's real
+    // idleClock->setTimezone() call, after WiFi/MQTT connect, is what
+    // actually starts SNTP.
   } else {
     Serial.println(
         "Second SSD1306 (text) init failed - check wiring on SDA=4 "
@@ -526,6 +692,12 @@ void setup() {
   // colorDepth 1: render into a 1-bit sprite. Anything else wastes RAM and
   // gets flattened by the panel anyway.
   avatar.init(1);
+
+  // RGB status LED: attaches its three LEDC channels and leaves it off until
+  // a message asks for a color (see mqtt_link.h's display()). Independent of
+  // both OLEDs above, so it's fine to bring up regardless of whether either
+  // panel's init() succeeded.
+  rgbLed.begin();
 
   // Pin app logic to core 0, leaving core 1 to the avatar's own tasks. 8192
   // rather than the demo's old 4096: WiFi, PubSubClient and ArduinoJson
@@ -540,3 +712,4 @@ void loop() {
   // the avatar; app work goes in appTask on core 0.
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
+#endif  // RGB_LED_TEST

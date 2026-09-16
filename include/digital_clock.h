@@ -92,25 +92,32 @@ class DigitalClock {
     // configTzTime() resets the clock to the epoch until SNTP's first sync
     // lands; localtime_r "succeeding" on that just yields 1970. Anything
     // before this file was written can only mean "not synced yet".
-    if (localtime_r(&now, &local) != nullptr && local.tm_year >= (2024 - 1900)) {
-      strftime(buf, sizeof(buf), "%H:%M", &local);
-    } else {
-      strncpy(buf, "--:--", sizeof(buf));
-    }
-
-    // Blink the colon at 1Hz rather than leaving it solid — draw() only
-    // runs once a second (see tick()), so every call is one blink half-cycle.
-    colonOn_ = !colonOn_;
-    if (!colonOn_) buf[2] = ' ';
+    bool synced =
+        localtime_r(&now, &local) != nullptr && local.tm_year >= (2024 - 1900);
 
     display_->startWrite();
     display_->fillScreen(TFT_BLACK);
-    display_->setTextColor(TFT_WHITE, TFT_BLACK);
-    // Size 4 is as large as "HH:MM" fits on a 128px-wide panel (5 chars *
-    // 6px * 4 = 120px) — any bigger and it clips off the sides.
-    display_->setTextSize(4);
-    display_->setTextDatum(textdatum_t::middle_center);
-    display_->drawString(buf, display_->width() / 2, display_->height() / 2);
+    if (synced) {
+      strftime(buf, sizeof(buf), "%H:%M", &local);
+      // Blink the colon at 1Hz rather than leaving it solid — draw() only
+      // runs once a second (see tick()), so every call is one blink
+      // half-cycle.
+      colonOn_ = !colonOn_;
+      if (!colonOn_) buf[2] = ' ';
+
+      display_->setTextColor(TFT_WHITE, TFT_BLACK);
+      // Size 4 is as large as "HH:MM" fits on a 128px-wide panel (5 chars *
+      // 6px * 4 = 120px) — any bigger and it clips off the sides.
+      display_->setTextSize(4);
+      display_->setTextDatum(textdatum_t::middle_center);
+      display_->drawString(buf, display_->width() / 2, display_->height() / 2);
+    }
+    // Correction, 2026-09-16: this used to fall back to a "--:--" placeholder
+    // while unsynced (see git history) - left up the whole time WiFi/NTP were
+    // still connecting, which read as a stuck/broken clock rather than a
+    // device still booting. Blank screen instead - main.cpp now plays a
+    // startup jingle for that wait (see jingle.h's playStartup()), so there's
+    // nothing this panel needs to say while it has no real time to show.
     display_->endWrite();
   }
 

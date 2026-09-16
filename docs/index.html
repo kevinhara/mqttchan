@@ -91,6 +91,19 @@
     width: auto;
     accent-color: #2f6feb;
   }
+  .inline-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: #ccc;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .inline-checkbox input[type="checkbox"] {
+    width: auto;
+    accent-color: #2f6feb;
+  }
   select, button {
     font-size: 0.95rem;
     padding: 0.5rem;
@@ -162,6 +175,20 @@
       </select>
       <button :disabled="!connected" @click="send">Send</button>
     </div>
+    <div class="row">
+      <select v-model="led">
+        <option v-for="c in ledColors" :key="c.value" :value="c.value">{{ c.label }}</option>
+      </select>
+      <label class="inline-checkbox">
+        <input type="checkbox" v-model="ledBlink" />
+        Blink
+      </label>
+    </div>
+    <div class="row">
+      <select v-model="jingle">
+        <option v-for="j in jingles" :key="j.value" :value="j.value">{{ j.label }}</option>
+      </select>
+    </div>
     <div class="sent-log" v-if="lastSent">Last sent: {{ lastSent }}</div>
   </section>
 
@@ -230,6 +257,26 @@ const BROKER_URL = "wss://mqtt.kev.nz/";
 const MQTT_TOPIC = "avatar/say";
 const EXPRESSIONS = ["Happy", "Angry", "Sad", "Doubt", "Sleepy", "Neutral"];
 
+// Matches MqttLink::ledColorFromString() in include/mqtt_link.h - "" (sent
+// as an empty string, same as omitting "led" entirely) leaves the LED off.
+const LED_COLORS = [
+  { value: "", label: "No LED" },
+  { value: "red", label: "Red" },
+  { value: "green", label: "Green" },
+  { value: "blue", label: "Blue" },
+  { value: "cycle", label: "Cycle" },
+];
+
+// Matches MqttLink::jingleFromString() in include/mqtt_link.h - "" (sent as
+// an empty string, same as omitting "jingle" entirely) plays nothing.
+const JINGLES = [
+  { value: "", label: "No jingle" },
+  { value: "chime", label: "Chime" },
+  { value: "alert", label: "Alert" },
+  { value: "fanfare", label: "Fanfare" },
+  { value: "gentle", label: "Gentle" },
+];
+
 // Must match include/ble_config.h exactly - these are the firmware's GATT
 // service/characteristic UUIDs, not placeholders.
 const BLE_SERVICE_UUID = "9f2e0000-9b5f-4a2e-8b7a-9c9f6f5b1a10";
@@ -263,6 +310,9 @@ createApp({
 
     const text = ref("");
     const expression = ref(EXPRESSIONS[0]);
+    const led = ref("");
+    const ledBlink = ref(false);
+    const jingle = ref("");
     const lastSent = ref("");
 
     // pass_ is intentionally never populated from a device read (see
@@ -468,7 +518,13 @@ createApp({
 
     async function send() {
       if (!connected.value) return;
-      const payload = JSON.stringify({ text: text.value, expression: expression.value });
+      const payload = JSON.stringify({
+        text: text.value,
+        expression: expression.value,
+        led: led.value,
+        blink: ledBlink.value,
+        jingle: jingle.value,
+      });
       try {
         if (mode.value === "mqtt") sendMqtt(payload);
         else await sendBluetooth(payload);
@@ -482,7 +538,8 @@ createApp({
       mode, bleSupported, switchMode,
       connected, connecting, statusText, statusClass, deviceStatus,
       connect, disconnect,
-      text, expression, expressions: EXPRESSIONS, lastSent, send,
+      text, expression, expressions: EXPRESSIONS, led, ledBlink, ledColors: LED_COLORS,
+      jingle, jingles: JINGLES, lastSent, send,
       settings, saving, saveStatusText, saveStatusClass, saveSettings,
       tzOptions,
     };

@@ -10,6 +10,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Avatar.h>
+#include <OneButton.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <string.h>
@@ -18,22 +19,36 @@
 
 #include "speech_bubble.h"
 #include "digital_clock.h"
+#include "rgb_led.h"
+#include "jingle.h"
 
 class MqttLink {
  public:
   // clock, if given, is what the bubble panel reverts to once a message has
   // finished displaying (see display()) — nullptr just leaves the last
-  // message on screen, the old behavior.
+  // message on screen, the old behavior. led, if given, is lit for as long
+  // as a message stays on screen (see display()) — nullptr just skips the
+  // LED entirely, same "optional peripheral" treatment as clock. jingle, if
+  // given, plays once as a message starts showing (see display()) — nullptr
+  // just skips the jingle entirely, same treatment again. button, if
+  // given, is polled (via its own tick(), so its usual debounce/click timing
+  // still applies) from inside display()'s blocking show()/holdWithCountdown()
+  // calls — see onButtonClick() — so a click can dismiss a message that is
+  // still typing or counting down, not just one already finished.
   MqttLink(m5avatar::Avatar *avatar, SpeechBubble *bubble,
            const char *const *expressionNames,
            const m5avatar::Expression *expressions, size_t expressionCount,
-           DigitalClock *clock = nullptr)
+           DigitalClock *clock = nullptr, RgbLed *led = nullptr,
+           OneButton *button = nullptr, Jingle *jingle = nullptr)
       : avatar_(avatar),
         bubble_(bubble),
         names_(expressionNames),
         exprs_(expressions),
         count_(expressionCount),
         clock_(clock),
+        led_(led),
+        button_(button),
+        jingle_(jingle),
         mqtt_(wifiClient_) {
     self_ = this;
   }
@@ -103,6 +118,21 @@ class MqttLink {
     }
     mqtt_.loop();
     drainQueue();
+    if (replayRequested_) {
+      // Set by onButtonClick() rather than calling display() directly from
+      // there - see the correction in onButtonClick()'s comment for why that
+      // has to be deferred to here, appTask's own top-level loop, instead.
+      replayRequested_ = false;
+      display(lastMessage_, 0);
+      return;
+    }
+    if (configInfoRequested_) {
+      // Same deferral as replayRequested_ just above, and for the same
+      // reason - see onButtonClick().
+      configInfoRequested_ = false;
+      showStartupInfo(bleName_, bleAddress_);
+      return;
+    }
     PendingMessage msg;
     size_t remaining;
     if (!popQueued(&msg, &remaining)) return;
@@ -150,31 +180,115 @@ class MqttLink {
   // about a second of it finishing typing.
   bool isHoldingMessage() const { return messageHeld_; }
 
-  // One-off "what am I connected to" message, shown right after begin()'s
-  // connect attempts settle so a glance at the bubble confirms the broker,
-  // link state, network identity and BLE identity without needing a laptop.
-  // Always holds for a fixed 10s regardless of setDisplayOptions()'s
-  // holdMs_/keepLastMessage_ - those govern real MQTT messages, not this one
-  // - then reverts to the idle clock the same way display() does. Only safe
-  // to call before loop() starts pulling from the queue (same constraint as
-  // injectForTest()/handleMessage() - see there), which is how main.cpp uses
-  // it.
+  // Wired up as the push button's click handler (see main.cpp) — a single
+  // click dismisses whatever message is currently on screen (whether it's
+  // still typing, counting down its hold, or sitting there indefinitely
+  // under keepLastMessage_), or, when nothing is on screen, replays the last
+  // message that was shown.
   //
-  // bleName/bleAddress are handed in rather than read from a BLE object this
-  // class doesn't own - main.cpp calls this after BleConfigService::begin(),
-  // passing the same device name it advertised and NimBLEDevice::getAddress()
-  // (see main.cpp's appTask). WiFi's hostname is set here, in connectWiFi(),
-  // rather than read back from anywhere else, since kHostname is this
-  // class's own constant either way.
+  // Called from two different situations that both land on appTask's
+  // thread, never concurrently: (1) main.cpp's plain button.tick() in its
+  // idle loop, when no message is active or one is being held indefinitely
+  // — display() isn't on the call stack, so any work needed happens right
+  // here; (2) the button_->tick() call display() itself makes from inside
+  // show()/holdWithCountdown() (see the constructor comment) while a message
+  // is actively typing/counting down — display() is already polling
+  // dismissRequested_ in that case, so this just sets the flag rather than
+  // acting directly, and lets display() unwind itself once it notices.
+  //
+  // Correction, 2026-09-16: the idle branch used to call display(lastMessage_,
+  // 0) directly, right here. Verified live that this makes the replayed
+  // message flash up for about one character and then vanish immediately -
+  // traced to OneButton::_fsm()'s OCS_COUNT case (OneButton.cpp): it invokes
+  // this very callback *before* calling reset(), with _state still OCS_COUNT
+  // and waitTime still past the click threshold. Calling display() inline
+  // here reaches show()'s abortRequested lambda, which polls button_->tick()
+  // again - reentrantly, on the same OneButton object, before the outer
+  // tick() call has reset anything - and that nested tick() re-evaluates the
+  // still-unreset OCS_COUNT state, decides a second click just happened, and
+  // fires this callback again immediately. That second call lands with
+  // messageActive_ already true (display() had just set it), so it takes the
+  // dismiss branch above and cuts the reveal off after ~1 character. Setting
+  // replayRequested_ instead defers the actual display() call to loop()'s
+  // next pass, which runs from appTask's own top-level for(;;), never nested
+  // inside a button_->tick() call - so its own button_->tick() polling is
+  // never reentrant. Verified live 2026-09-16: replay now holds for the full
+  // holdMs_ instead of vanishing.
+  void onButtonClick() {
+    if (messageActive_) {
+      if (messageHeld_) {
+        revertToIdle();
+      } else {
+        dismissRequested_ = true;
+      }
+      return;
+    }
+    // Correction, 2026-09-16: the idle-and-nothing-yet case used to do
+    // nothing at all. It now shows the "what am I connected to" summary
+    // instead (see showStartupInfo()) - deferred to loop() via
+    // configInfoRequested_, the same indirection replayRequested_ above
+    // uses and for the same reason (see the correction in this function's
+    // header comment): calling straight into a blocking bubble_->show()
+    // from inside this callback re-enters OneButton::tick() and misfires.
+    if (haveLastMessage_) {
+      replayRequested_ = true;
+    } else {
+      configInfoRequested_ = true;
+    }
+  }
+
+  // "What am I connected to" summary - reports the broker, link state,
+  // network identity and BLE identity so a glance at the bubble answers that
+  // without needing a laptop. Always holds for a fixed 10s regardless of
+  // setDisplayOptions()'s holdMs_/keepLastMessage_ - those govern real MQTT
+  // messages, not this one - then reverts to the idle clock the same way
+  // display() does.
+  //
+  // Correction, 2026-09-16: this used to be shown automatically, once, right
+  // after appTask's connect attempts settled - added 2026-09-15 so the info
+  // was readable off the panel without a laptop. Changed so it no longer
+  // appears on boot at all: a freshly-flashed device sitting on a desk has no
+  // reason to broadcast its diagnostics before anyone's asked for them. It
+  // now only shows on demand - see onButtonClick()'s configInfoRequested_
+  // branch above, which fires on a click while idle and only for as long as
+  // no MQTT/BLE message has ever arrived (haveLastMessage_ false); once any
+  // message has been shown, that same idle click replays it instead (see
+  // replayRequested_) and this screen is unreachable again until the next
+  // reboot. bleName_/bleAddress_ are captured once via setBleIdentity() below
+  // instead of being passed in here, since this is no longer called from a
+  // context that has them to hand.
   void showStartupInfo(const String &bleName, const String &bleAddress) {
     if (bubble_ == nullptr) return;
     String text = String("MQTT ") + host_ + ":" + port_ + " - " +
                   (mqtt_.connected() ? "online" : "offline") + " | " +
                   kHostname + " " + WiFi.localIP().toString() + " | BLE " +
                   bleName + " " + bleAddress;
-    bubble_->show(text.c_str());
-    bubble_->holdWithCountdown(10000);
+    // button_->tick() pumped through both blocking calls below, same as
+    // display() does for a real message - without it OneButton misses
+    // however many polls this 10s+ round trip skips, which can desync its
+    // click-timing state for whatever the next real press is. Always
+    // returning false: nothing here supports dismissing this screen early,
+    // just keeping OneButton's own bookkeeping current while it plays out.
+    bubble_->show(text.c_str(), 45, [this] {
+      if (button_ != nullptr) button_->tick();
+      return false;
+    });
+    bubble_->holdWithCountdown(10000, 50, [this] {
+      if (button_ != nullptr) button_->tick();
+      return false;
+    });
     if (clock_ != nullptr) clock_->showNow();
+  }
+
+  // Records the BLE identity for showStartupInfo() above, called once from
+  // main.cpp's appTask after BleConfigService::begin() - the same point that
+  // used to call showStartupInfo() directly (see the correction there).
+  // Doesn't draw anything itself. WiFi's hostname is set separately, in
+  // connectWiFi(), rather than captured here, since kHostname is this
+  // class's own constant either way.
+  void setBleIdentity(const String &bleName, const String &bleAddress) {
+    bleName_ = bleName;
+    bleAddress_ = bleAddress;
   }
 
  private:
@@ -188,6 +302,9 @@ class MqttLink {
   static constexpr const char *kHostname = "mqttchan";
   // First-boot default for holdMs_ below - see DeviceSettings::load().
   static constexpr uint32_t kDefaultMessageHoldMs = 30000;
+  // Silence held after a jingle finishes and before typing's own beeps
+  // start - see display()'s use of this below.
+  static constexpr uint32_t kPostJingleGapMs = 300;
 
   void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
@@ -228,10 +345,44 @@ class MqttLink {
   struct PendingMessage {
     String text;
     String exprName;
+    LedColor ledColor = LedColor::None;
+    bool ledBlink = false;
+    JingleTune jingle = JingleTune::None;
   };
 
   static void onMessage(char *topic, uint8_t *payload, unsigned int length) {
     if (self_ != nullptr) self_->enqueue(payload, length);
+  }
+
+  // "led" is optional and, when present, must be one of these four strings
+  // (case-sensitive, same convention as "expression"'s kExpressionNames
+  // match) - anything else logs a warning and leaves the LED off for this
+  // message, same "unrecognized falls back rather than fails" treatment as
+  // an unrecognized expression.
+  static LedColor ledColorFromString(const String &name) {
+    if (name.length() == 0) return LedColor::None;
+    if (name == "red") return LedColor::Red;
+    if (name == "green") return LedColor::Green;
+    if (name == "blue") return LedColor::Blue;
+    if (name == "cycle") return LedColor::Cycle;
+    Serial.printf("MQTT: unrecognized led color '%s', leaving LED off\n",
+                  name.c_str());
+    return LedColor::None;
+  }
+
+  // "jingle" is optional and, when present, must be one of these four
+  // strings (case-sensitive, same convention as "led"/"expression" above) -
+  // anything else logs a warning and plays nothing for this message, same
+  // "unrecognized falls back rather than fails" treatment as the other two.
+  static JingleTune jingleFromString(const String &name) {
+    if (name.length() == 0) return JingleTune::None;
+    if (name == "chime") return JingleTune::Chime;
+    if (name == "alert") return JingleTune::Alert;
+    if (name == "fanfare") return JingleTune::Fanfare;
+    if (name == "gentle") return JingleTune::Gentle;
+    Serial.printf("MQTT: unrecognized jingle '%s', playing nothing\n",
+                  name.c_str());
+    return JingleTune::None;
   }
 
   bool parseMessage(const uint8_t *payload, unsigned int length,
@@ -245,6 +396,9 @@ class MqttLink {
     }
     out->text = doc["text"] | "";
     out->exprName = doc["expression"] | "";
+    out->ledColor = ledColorFromString(doc["led"] | "");
+    out->ledBlink = doc["blink"] | false;
+    out->jingle = jingleFromString(doc["jingle"] | "");
     return true;
   }
 
@@ -341,31 +495,94 @@ class MqttLink {
     // branch below decides whether this one ends up held too.
     messageHeld_ = false;
     if (bubble_ != nullptr && msg.text.length() > 0) {
+      // Remembered so onButtonClick() can replay this exact message (text +
+      // expression + LED) once nothing is on screen - see there.
+      lastMessage_ = msg;
+      haveLastMessage_ = true;
+      // "On screen" from here until revertToIdle() below - covers typing,
+      // counting down, and (via keepLastMessage_) sitting indefinitely.
+      // onButtonClick() checks this to decide dismiss-vs-replay.
+      messageActive_ = true;
+      dismissRequested_ = false;
+
+      // Lit before typing starts and left running through the hold below -
+      // "on screen" covers the whole reveal-plus-hold, not just the hold
+      // - see rgb_led.h's start()/stop().
+      if (led_ != nullptr) led_->start(msg.ledColor, msg.ledBlink);
+      // Played before typing starts, not alongside it - Jingle::play() blocks
+      // this thread for the tune's duration, so it finishes before
+      // bubble_->show() below starts firing its own per-character tone()
+      // calls on the same piezo pin (see jingle.h). kPostJingleGapMs holds a
+      // beat of silence afterward so the jingle's last note doesn't run
+      // straight into the first typing beep - only when a tune actually
+      // played (msg.jingle != None); skipped otherwise so a plain message
+      // isn't delayed for a jingle it never had.
+      if (jingle_ != nullptr) {
+        jingle_->play(msg.jingle);
+        if (msg.jingle != JingleTune::None) {
+          vTaskDelay(pdMS_TO_TICKS(kPostJingleGapMs));
+        }
+      }
       lipSyncActive_ = true;
       xTaskCreatePinnedToCore(lipSyncTask, "lipSync", 2048, this, 1, nullptr,
                               PRO_CPU_NUM);
-      bubble_->show(msg.text.c_str());
+      // button_->tick() runs here, on this thread, roughly every charDelayMs
+      // - see the constructor comment for why display() has to poll the
+      // button itself rather than relying on main.cpp's own tick() loop,
+      // which doesn't get a turn again until show()/holdWithCountdown()
+      // below return.
+      bubble_->show(msg.text.c_str(), 45, [this] {
+        if (button_ != nullptr) button_->tick();
+        return dismissRequested_;
+      });
       lipSyncActive_ = false;
+
+      if (dismissRequested_) {
+        // Clicked mid-typing - go straight to idle rather than drawing the
+        // queue indicator/countdown for a message that's being dismissed.
+        revertToIdle();
+        return;
+      }
       bubble_->drawQueueIndicator(remainingQueued);
 
       if (keepLastMessage_) {
         // Configured to leave the last message up indefinitely (see
         // setDisplayOptions()) - skip the hold/countdown and the revert to
         // the idle clock below; the face and bubble stay exactly as set
-        // until the next message arrives. messageHeld_ tells main.cpp's loop
-        // to stop calling idleClock->tick(), which would otherwise draw over
-        // this same panel the moment the wall-clock second changes.
+        // until the next message arrives, or onButtonClick() dismisses it
+        // directly (no blocking loop here to poll dismissRequested_ against
+        // - see onButtonClick()). messageHeld_ tells main.cpp's loop to stop
+        // calling idleClock->tick(), which would otherwise draw over this
+        // same panel the moment the wall-clock second changes. The LED stays
+        // lit too - it comes back to start()/stop() the next time a message
+        // arrives, same as the bubble text it tracks.
         messageHeld_ = true;
         return;
       }
 
       // Hold the message on screen for a bit (with a shrinking countdown bar
       // along the bottom) before handing the face and bubble panel back to
-      // their idle look, rather than reverting the instant typing finishes.
-      bubble_->holdWithCountdown(holdMs_);
-      avatar_->setExpression(m5avatar::Expression::Neutral);
-      if (clock_ != nullptr) clock_->showNow();
+      // their idle look, rather than reverting the instant typing finishes -
+      // cut short by a click the same way show() above is.
+      bubble_->holdWithCountdown(holdMs_, 50, [this] {
+        if (button_ != nullptr) button_->tick();
+        return dismissRequested_;
+      });
+      revertToIdle();
     }
+  }
+
+  // Shared "message is done being shown, go back to idle" cleanup - used
+  // both when a hold finishes on its own and when a click cuts one short
+  // (see onButtonClick()).
+  void revertToIdle() {
+    if (bubble_ != nullptr) bubble_->clear();
+    avatar_->setExpression(m5avatar::Expression::Neutral);
+    if (clock_ != nullptr) clock_->showNow();
+    if (led_ != nullptr) led_->stop();
+    messageActive_ = false;
+    messageHeld_ = false;
+    dismissRequested_ = false;
   }
 
   // Fake lip-sync, same noisy-envelope trick as main.cpp's demo-mode
@@ -394,6 +611,36 @@ class MqttLink {
   // Set by display() when keepLastMessage_ leaves a message up instead of
   // reverting to the idle clock; read by isHoldingMessage(). See there.
   bool messageHeld_ = false;
+  // True for the whole time a message is visibly on screen (typing,
+  // counting down, or held indefinitely) - set at the top of display()'s
+  // bubble branch, cleared by revertToIdle(). onButtonClick() reads this to
+  // decide whether a click means "dismiss" or "replay the last message".
+  bool messageActive_ = false;
+  // Set by onButtonClick() while display() is blocked inside show()/
+  // holdWithCountdown(); polled by the lambdas passed to those calls (see
+  // display()) so a click can cut a message short instead of waiting for it
+  // to finish on its own.
+  volatile bool dismissRequested_ = false;
+  // The last message actually shown (text/expression/LED), so onButtonClick()
+  // can redisplay it when nothing is currently on screen. Only ever set from
+  // display(), on appTask's own thread - see onButtonClick().
+  PendingMessage lastMessage_;
+  bool haveLastMessage_ = false;
+  // Set by onButtonClick() when a click arrives with nothing on screen;
+  // consumed by loop() on its next pass, which calls display(lastMessage_,
+  // 0) from there instead of onButtonClick() calling it directly - see the
+  // correction in onButtonClick()'s comment for why that indirection is
+  // required (calling display() straight from the click callback re-enters
+  // OneButton::tick() and double-fires the click).
+  volatile bool replayRequested_ = false;
+  // Set by onButtonClick() when a click arrives idle and no message has ever
+  // been shown (haveLastMessage_ false); consumed by loop() the same way
+  // replayRequested_ is, for the same re-entrancy reason - see there.
+  volatile bool configInfoRequested_ = false;
+  // Captured once via setBleIdentity(), read by showStartupInfo() when
+  // configInfoRequested_ fires - see both.
+  String bleName_;
+  String bleAddress_;
 
   // Messages waiting to be displayed - pushed by enqueue() (from either the
   // MQTT callback on appTask or a BLE test-message write on the NimBLE host
@@ -411,6 +658,9 @@ class MqttLink {
   const m5avatar::Expression *exprs_;
   size_t count_;
   DigitalClock *clock_;
+  RgbLed *led_;
+  OneButton *button_;
+  Jingle *jingle_;
 
   // String, not const char*: values can now come from BLE config writes
   // (see reconfigure()), which don't outlive a caller-owned buffer the way

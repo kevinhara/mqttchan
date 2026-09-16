@@ -26,7 +26,14 @@ class SpeechBubble {
   // charDelayMs, which is the point: it paces itself to be readable rather
   // than dumping the whole bubble in one frame. 45ms lands around a slower,
   // more deliberate pace; drop it if a phrase is long enough to feel sluggish.
-  void show(const char *text, uint32_t charDelayMs = 45) {
+  //
+  // abortRequested, if given, is polled once per character (i.e. about once
+  // per charDelayMs — the same cadence callers normally tick an input device
+  // at) and stops the reveal early when it returns true, leaving whatever's
+  // been typed so far on screen. MqttLink uses this so a button click can
+  // interrupt a long message instead of waiting for it to finish.
+  void show(const char *text, uint32_t charDelayMs = 45,
+            std::function<bool()> abortRequested = nullptr) {
     // Reasserted here, not just at construction: DigitalClock draws to this
     // same display between messages and leaves its own (much larger)
     // setTextSize() in place, which wrapLines()'s width math below would
@@ -87,6 +94,10 @@ class SpeechBubble {
         display_->display();
         if (onChar_ && line[i] != ' ') onChar_();
         vTaskDelay(pdMS_TO_TICKS(charDelayMs));
+        if (abortRequested && abortRequested()) {
+          display_->endWrite();
+          return;
+        }
       }
     }
     display_->endWrite();
@@ -121,7 +132,11 @@ class SpeechBubble {
   // left edge as time elapses — a visual countdown to when the caller will
   // clear/revert the panel. Runs on the caller's thread same as show():
   // blocks for durationMs.
-  void holdWithCountdown(uint32_t durationMs, uint32_t stepMs = 50) {
+  //
+  // abortRequested, if given, is polled once per stepMs (same idea as
+  // show()'s abortRequested) and ends the hold early when it returns true.
+  void holdWithCountdown(uint32_t durationMs, uint32_t stepMs = 50,
+                         std::function<bool()> abortRequested = nullptr) {
     const int barX = kMargin;
     const int barWidth = display_->width() - 2 * kMargin;
     const int barY = display_->height() - kBarMargin - kBarHeight;
@@ -131,6 +146,7 @@ class SpeechBubble {
     for (;;) {
       uint32_t elapsed = millis() - start;
       if (elapsed >= durationMs) break;
+      if (abortRequested && abortRequested()) break;
       float remaining = 1.0f - static_cast<float>(elapsed) / durationMs;
       int w = static_cast<int>(barWidth * remaining);
       // Redraw the whole bar track each tick rather than only the shrunk-away

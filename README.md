@@ -89,6 +89,75 @@ by the other OLED panel or M5Unified. Clocked at 400kHz rather than the
 hardware bus's 800kHz, since bit-banged timing is CPU-cycle-bound and less
 forgiving at high speed.
 
+## RGB status LED
+
+A 4-pin RGB LED (3 color legs + 1 common leg), wired straight to the ESP32 —
+no driver board, just a resistor per color leg.
+
+| Leg | GPIO | Resistor |
+|---|---|---|
+| Red | GPIO25 | ~150–220Ω |
+| Green | GPIO26 | ~220–330Ω |
+| Blue | GPIO14 | ~220–330Ω |
+| Common | GND | none |
+
+**Verified live 2026-09-16** on the same `/dev/cu.usbserial-0001` board:
+wired common-cathode (common leg to GND), all three legs confirmed against
+their GPIO via the `RGB_LED_TEST` build below — red/green/blue/off cycle and
+a full HSV spectrum sweep both rendered the correct colors with no cross-talk
+between channels.
+
+**Put one resistor per color leg, not one shared resistor on the common
+leg.** Each color die has a different forward voltage (red ≈2.0V,
+green/blue ≈3.0V at 3.3V logic), so a single shared resistor over- or
+under-drives whichever color has a different Vf, unevenly across channels.
+The common leg itself needs no resistor — it's just the return path.
+
+**This board is a 30-pin ESP32 devkit — GPIO16/17 aren't broken out**, unlike
+on 38-pin boards where they usually are. GPIO25/26/14 were picked instead:
+all three drive over LEDC PWM, and none collide with the OLED buses
+(GPIO4/15, GPIO32/33), the piezo (GPIO27), the boot-strapping pins
+(0/2/5/12), or M5Unified's reserved PortA pins (21/22 — see the comment in
+`ssd1306_display.h`).
+
+**If the LED turns out common-anode instead** (common leg to 3V3, not GND),
+don't rewire it — `#define RGB_COMMON_ANODE` above the pin defines in
+`main.cpp` inverts the PWM duty cycle in software instead.
+
+**Building/rewiring on a breadboard-free case:** with Dupont jumpers jammed
+straight into the 3D-printed case rather than a breadboard, splice each
+resistor into its own jumper wire (cut a female-to-female wire in half,
+twist/solder the resistor lead to the bared end, heat-shrink the joint) —
+keeps the same connector style as the rest of the wiring rather than
+introducing a different mechanical fit.
+
+A standalone wiring-test build lives behind a flag rather than in the real
+app, same pattern as `AVATAR_DEMO_MODE`/`AVATAR_FB_DUMP` below — see
+`RGB_LED_TEST` in `main.cpp`. Build/flash it with:
+
+```
+PLATFORMIO_BUILD_FLAGS="-D RGB_LED_TEST" pio run -e esp32dev -t upload
+```
+
+It replaces `setup()`/`loop()` entirely (no WiFi/MQTT/avatar involved):
+cycles red → green → blue → off at full brightness (0.7s each, with serial
+prints), then sweeps a full 360° HSV rainbow at ~15ms/step. Reflash without
+the flag (`pio run -e esp32dev -t upload`) to return to the real app.
+
+**In the real (non-`RGB_LED_TEST`) app, the LED is message-driven.** A
+message payload's optional `"led"` field (`"red"`/`"green"`/`"blue"`/
+`"cycle"`) and optional `"blink"` boolean (default `false`) — see "MQTT-driven
+mode" below — light `include/rgb_led.h`'s `RgbLed` for exactly as long as
+that message is on the bubble panel (typing + hold, or indefinitely under
+`keepLastMessage`), then it turns off along with the bubble reverting to the
+idle clock. `"cycle"` sweeps the same HSV rainbow as the wiring test above;
+`"blink"` toggles whatever color is active (solid or cycling) on/off every
+400ms. An unrecognized `"led"` string logs a warning and leaves the LED off
+for that message, same "falls back rather than fails" treatment as an
+unrecognized `"expression"`. Not yet verified live against a real message
+flow — the wiring test above confirmed the physical LED itself, but this
+message-driven path has only been build-verified so far.
+
 ## The speech bubble (second panel)
 
 `include/speech_bubble.h`'s `SpeechBubble` class draws a bordered,
@@ -246,6 +315,18 @@ eyeballed as part of this check (no camera on this session) — worth a glance
 next power-up to confirm the split/orientation actually reads as intended,
 given the rotation correction above came from exactly that kind of miss.
 
+**Correction, 2026-09-16: the beep now fires at the *start* of POST, not the
+end.** The paragraph above described a single beep firing "the instant the
+POST side finishes," modeled on the AMI/Award "self-test passed" chime at
+hand-off to the bootloader. On reflection the beep these old boot screens are
+actually remembered for is the one that opens the self test, not the one that
+closes it, so `main.cpp`'s boot loop now fires `tone(PIEZO_PIN, 1000, 150)`
+once, immediately after `boot::begin()` and before the loop's first
+`boot::draw(u8g2Top)` call — not when `boot::done()` goes true. `bootDone`/
+`bootDoneAt` still exist and still gate `PHASE_HOLD_MS`; they just no longer
+also gate the beep. Not re-verified live since this only moves *when* an
+already-verified `tone()` call fires, not what it does.
+
 **Correction/update, 2026-09-16:** three more changes, made on feedback from
 actually looking at the panel — proof the "worth a glance" note above was
 right to flag.
@@ -372,13 +453,30 @@ it. The synthwave riff likewise hasn't been listened to yet.
 
 Default build (no flags). `include/mqtt_link.h`'s `MqttLink` owns WiFi +
 MQTT: connects, subscribes to one topic, and on every message parses
-`{"text": "...", "expression": "..."}` JSON and calls
-`avatar.setExpression()` + `bubble->show(text)` straight from the PubSubClient
-callback — safe here because that callback already runs inside
+`{"text": "...", "expression": "...", "led": "...", "blink": ..., "jingle": "..."}` JSON and
+calls `avatar.setExpression()` + `bubble->show(text)` straight from the
+PubSubClient callback — safe here because that callback already runs inside
 `mqttLink.loop()` on core 0/`appTask`, the same task that owned those calls in
 demo mode, and `setExpression()` already suspends the draw task internally.
 No queue needed for a single-producer, single-consumer, already-single-task
 design.
+
+`"led"` and `"blink"` are both optional. `"led"` picks the RGB status LED's
+color for as long as this message is on screen — `"red"`/`"green"`/`"blue"`
+for a solid color or `"cycle"` for a slow HSV rainbow sweep; omit it (or
+leave it `""`) to keep the LED off. `"blink"` (default `false`) toggles
+whichever color is active on/off every 400ms instead of holding it solid.
+See "RGB status LED" above for the hardware and `include/rgb_led.h` for the
+implementation.
+
+`"jingle"` is also optional and picks a short notification tune to play on
+the piezo (`PIEZO_PIN`) right as the message starts showing, before its text
+begins typing — `"chime"`, `"alert"`, `"fanfare"`, or `"gentle"`; omit it (or
+leave it `""`, the default) to play nothing. Each tune runs synchronously and
+finishes in well under a second, so it never overlaps `beepChar()`'s own
+per-character tone() calls on the same pin. An unrecognized `"jingle"` string
+logs a warning and plays nothing, same fallback as `"led"`/`"expression"`.
+See `include/jingle.h` for the note tables.
 
 Config lives in `include/secrets.h` (gitignored — copy `secrets.h.example`
 and fill in `WIFI_SSID`/`WIFI_PASS`/`MQTT_HOST`/`MQTT_PORT`/`MQTT_TOPIC`).
@@ -403,15 +501,24 @@ A few sharp edges worth knowing if this stops working:
   and hammering `client.connect()` against a dead link.
 - The board publishes `avatar/status` (`"online"`/`"offline"` via MQTT LWT,
   retained) so anything watching can tell if it's actually up.
-- **`MqttLink::showStartupInfo()`'s bubble message** (shown once, right after
-  `appTask` connects, before the normal message queue starts servicing) now
-  reports MQTT host/port/status, WiFi hostname (`mqttchan`, set via
-  `WiFi.setHostname()` in `connectWiFi()` — ahead of `WiFi.begin()`, since
-  ESP32 only honors it if set before the connection is made) + IP, and the
-  BLE device name/address — added 2026-09-15 so all of that is readable off
-  the panel itself rather than needing a laptop. `main.cpp`'s `appTask` had
-  to move `bleConfig.begin()` earlier, ahead of this call instead of after
-  it, so the BLE address (`NimBLEDevice::getAddress()`) exists yet.
+- **`MqttLink::showStartupInfo()`'s bubble message** reports MQTT
+  host/port/status, WiFi hostname (`mqttchan`, set via `WiFi.setHostname()`
+  in `connectWiFi()` — ahead of `WiFi.begin()`, since ESP32 only honors it if
+  set before the connection is made) + IP, and the BLE device name/address.
+  **Correction, 2026-09-16:** this used to show automatically, once, right
+  after `appTask` connects — added 2026-09-15 so that was readable off the
+  panel without a laptop. Changed so it no longer appears on boot at all: a
+  freshly-flashed device sitting on a desk has no reason to broadcast its
+  diagnostics before anyone's asked for them. It now only shows on demand —
+  a click on the button while the bubble is idle **and no MQTT/BLE message
+  has ever arrived yet** (see `MqttLink::onButtonClick()`'s
+  `configInfoRequested_` branch, deferred to `loop()` the same way a replay
+  is). Once any message has been shown, that latches for good and the same
+  idle click instead replays the last message — this diagnostic screen is
+  unreachable again until the next reboot. `main.cpp`'s `appTask` still
+  starts `bleConfig.begin()` ahead of this, but now only so
+  `mqttLink.setBleIdentity()` can capture the BLE address
+  (`NimBLEDevice::getAddress()`) for whenever the button click does arrive.
 - **The "ISS is passing overhead" message some sessions saw isn't from this
   repo at all** — it's `~/Homelab/osmo/avatar-brain`'s `producers/iss.py`, a
   separate MQTT publisher that polls a live-position API and posts to
