@@ -10,6 +10,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Avatar.h>
+#include <M5GFX.h>
 #include <OneButton.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -38,11 +39,18 @@ class MqttLink {
   // still applies) from inside display()'s blocking show()/holdWithCountdown()
   // calls — see onButtonClick() — so a click can dismiss a message that is
   // still typing or counting down, not just one already finished.
+  // faceDisplay/textDisplay, if given, are the two raw M5GFX panels
+  // (avatar/face and bubble/clock respectively) — not otherwise reachable
+  // through avatar_/bubble_, which only expose drawing calls, not panel
+  // power state. Used solely by applyScreenPower() to send the SSD1306
+  // sleep/wake command overnight — see there. nullptr just skips that
+  // entirely, same "optional peripheral" treatment as clock/led/jingle.
   MqttLink(m5avatar::Avatar *avatar, SpeechBubble *bubble,
            const char *const *expressionNames,
            const m5avatar::Expression *expressions, size_t expressionCount,
            DigitalClock *clock = nullptr, RgbLed *led = nullptr,
-           OneButton *button = nullptr, Jingle *jingle = nullptr)
+           OneButton *button = nullptr, Jingle *jingle = nullptr,
+           M5GFX *faceDisplay = nullptr, M5GFX *textDisplay = nullptr)
       : avatar_(avatar),
         bubble_(bubble),
         names_(expressionNames),
@@ -52,6 +60,8 @@ class MqttLink {
         led_(led),
         button_(button),
         jingle_(jingle),
+        faceDisplay_(faceDisplay),
+        textDisplay_(textDisplay),
         mqtt_(wifiClient_) {
     self_ = this;
   }
@@ -129,6 +139,7 @@ class MqttLink {
     mqtt_.loop();
     drainQueue();
     applyRestingExpression();
+    applyScreenPower();
     if (replayRequested_) {
       // Set by onButtonClick() rather than calling display() directly from
       // there - see the correction in onButtonClick()'s comment for why that
@@ -554,6 +565,14 @@ class MqttLink {
       messageActive_ = true;
       dismissRequested_ = false;
 
+      // Overnight the panels are powered off (see applyScreenPower()), but
+      // that's meant to stop an unread idle clock/face lighting the room up
+      // all night, not to swallow a real notification - wake both panels for
+      // an actual message, same as a button press would. revertToIdle()
+      // below puts them back to sleep once this message is done, if it's
+      // still within the screen-off window.
+      wakeForMessage();
+
       // Lit before typing starts and left running through the hold below -
       // "on screen" covers the whole reveal-plus-hold, not just the hold
       // - see rgb_led.h's start()/stop().
@@ -637,6 +656,9 @@ class MqttLink {
     applyRestingExpression();
     if (clock_ != nullptr) clock_->showNow();
     if (led_ != nullptr) led_->stop();
+    // Undoes wakeForMessage() above, if it woke the panels for this message -
+    // see there and resleepIfNight().
+    resleepIfNight();
   }
 
   // True between 23:00 and 07:00 local time - the window the resting face
@@ -669,6 +691,73 @@ class MqttLink {
     restingIsNight_ = state;
     avatar_->setExpression(night ? m5avatar::Expression::Sleepy
                                   : m5avatar::Expression::Neutral);
+  }
+
+  // True from midnight up to (not including) 07:00 local time - the window
+  // both OLED panels should be powered off in, rather than just showing an
+  // unread idle clock/Sleepy face all night. Deliberately starts at midnight
+  // rather than isNighttime()'s 23:00: that earlier boundary is only about
+  // the resting face's expression, not the panels' power state, and the two
+  // don't have to (and here don't) share a threshold. Same unsynced-time
+  // guard as isNighttime(), and for the same reason.
+  bool isScreenOffTime() const {
+    time_t now = time(nullptr);
+    struct tm local;
+    if (localtime_r(&now, &local) == nullptr || local.tm_year < (2024 - 1900))
+      return false;
+    return local.tm_hour < 7;
+  }
+
+  // Sends the SSD1306 sleep/wake command to both panels on an actual
+  // midnight/morning transition - screensAsleep_ makes this a once-per-
+  // transition call rather than one every ~50ms tick, same pattern as
+  // applyRestingExpression()'s restingIsNight_. Unlike applyRestingExpression(),
+  // this runs unconditionally rather than early-returning while a message is
+  // active: the whole point is that the panels default to off overnight
+  // regardless of what display() is doing to them at any given moment - an
+  // idle clock/resting face never gets to light the room up unread. A real
+  // message still wakes the panels for as long as it's on screen - see
+  // wakeForMessage()/resleepIfNight(), called from display()/revertToIdle()
+  // - so this function's job is specifically the *resting* state, not an
+  // absolute "off" for the whole window.
+  void applyScreenPower() {
+    bool shouldSleep = isScreenOffTime();
+    if (shouldSleep == screensAsleep_) return;
+    screensAsleep_ = shouldSleep;
+    if (faceDisplay_ != nullptr) {
+      shouldSleep ? faceDisplay_->sleep() : faceDisplay_->wakeup();
+    }
+    if (textDisplay_ != nullptr) {
+      shouldSleep ? textDisplay_->sleep() : textDisplay_->wakeup();
+    }
+  }
+
+  // Called from display() right as a real message starts, before typing -
+  // wakes both panels if applyScreenPower() had put them to sleep, the same
+  // way a button press would, so an actual notification is never silently
+  // swallowed overnight. Deliberately leaves screensAsleep_ set to true:
+  // that flag tracks what the *resting* state should be, which hasn't
+  // changed just because one message is being shown on top of it - see
+  // resleepIfNight(), which reads it back once the message is done.
+  void wakeForMessage() {
+    if (!screensAsleep_) return;
+    if (faceDisplay_ != nullptr) faceDisplay_->wakeup();
+    if (textDisplay_ != nullptr) textDisplay_->wakeup();
+  }
+
+  // Undoes wakeForMessage() once a message finishes - called from
+  // revertToIdle(). Recomputes isScreenOffTime() fresh rather than trusting
+  // screensAsleep_ as-is: a message that started right at the midnight/07:00
+  // boundary and held for a while (holdMs_, or indefinitely under
+  // keepLastMessage_) could have crossed it in either direction while
+  // loop() was blocked inside display(), so this is what keeps screensAsleep_
+  // and the panels' actual state from drifting apart across that edge.
+  void resleepIfNight() {
+    bool night = isScreenOffTime();
+    screensAsleep_ = night;
+    if (!night) return;  // already awake from wakeForMessage() - leave it
+    if (faceDisplay_ != nullptr) faceDisplay_->sleep();
+    if (textDisplay_ != nullptr) textDisplay_->sleep();
   }
 
   // Fake lip-sync, same noisy-envelope trick as main.cpp's demo-mode
@@ -709,6 +798,11 @@ class MqttLink {
   // "day" and skip the very first avatar_->setExpression() call. Read/written
   // only from applyRestingExpression()/revertToIdle(), both on appTask.
   int8_t restingIsNight_ = -1;
+  // Plain bool, unlike restingIsNight_ above: applyScreenPower() runs
+  // unconditionally (see there), so there's no "not yet applied" case to
+  // distinguish from day - defaulting to false (awake) just means boot
+  // doesn't send a redundant wakeup() to panels that are already on.
+  bool screensAsleep_ = false;
   // Set by onButtonClick() while display() is blocked inside show()/
   // holdWithCountdown(); polled by the lambdas passed to those calls (see
   // display()) so a click can cut a message short instead of waiting for it
@@ -754,6 +848,8 @@ class MqttLink {
   RgbLed *led_;
   OneButton *button_;
   Jingle *jingle_;
+  M5GFX *faceDisplay_;
+  M5GFX *textDisplay_;
 
   // WiFi hostname and self-reference text (showStartupInfo()) - set via
   // setDeviceName() before begin(), and again whenever a BLE config write

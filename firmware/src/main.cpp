@@ -358,7 +358,7 @@ static void appTask(void *) {
 
   static MqttLink mqttLink(&avatar, bubble, kExpressionNames, kExpressions,
                             kExpressionCount, idleClock, &rgbLed, &button,
-                            &jingle);
+                            &jingle, &oled, &oledText);
   // Plays once, right as appTask starts up, before the bubble panel shows
   // anything - see jingle.h's playStartup() for why this is its own tune
   // rather than one of the message-notification jingles or splash.cpp's boot
