@@ -415,15 +415,17 @@ class MqttLink {
   }
 
   // "jingle" is optional and, when present, must be one of these four
-  // strings (case-sensitive, same convention as "led"/"expression" above) -
-  // anything else logs a warning and plays nothing for this message, same
-  // "unrecognized falls back rather than fails" treatment as the other two.
+  // strings, matched case-insensitively for the same reason "led" and
+  // "expression" are (contract v2, 2026-09-17) - being the one field that
+  // still cared about case would be a trap, not a convention. Anything else
+  // logs a warning and plays nothing for this message, same "unrecognized
+  // falls back rather than fails" treatment as the other two.
   static JingleTune jingleFromString(const String &name) {
     if (name.length() == 0) return JingleTune::None;
-    if (name == "chime") return JingleTune::Chime;
-    if (name == "alert") return JingleTune::Alert;
-    if (name == "fanfare") return JingleTune::Fanfare;
-    if (name == "gentle") return JingleTune::Gentle;
+    if (strcasecmp(name.c_str(), "chime") == 0) return JingleTune::Chime;
+    if (strcasecmp(name.c_str(), "alert") == 0) return JingleTune::Alert;
+    if (strcasecmp(name.c_str(), "fanfare") == 0) return JingleTune::Fanfare;
+    if (strcasecmp(name.c_str(), "gentle") == 0) return JingleTune::Gentle;
     Serial.printf("MQTT: unrecognized jingle '%s', playing nothing\n",
                   name.c_str());
     return JingleTune::None;

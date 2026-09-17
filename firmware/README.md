@@ -507,6 +507,10 @@ strings; it now accepts:
 Matching is case-insensitive. Only the exact 6-digit hex form parses — a short
 `#fff` logs a warning and leaves the LED off, rather than being guessed at.
 
+`"jingle"` was made case-insensitive in the same change. It is not otherwise
+altered — being the one remaining field that cared about case would have been a
+trap rather than a convention.
+
 **Arbitrary colors are approximate, not calibrated.** The per-channel resistors
 are deliberately unmatched (see "RGB status LED" above), because the color dies
 have different forward voltages. Full-scale primaries look right; mixed colors
