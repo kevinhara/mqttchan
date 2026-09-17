@@ -511,6 +511,22 @@ Matching is case-insensitive. Only the exact 6-digit hex form parses — a short
 altered — being the one remaining field that cared about case would have been a
 trap rather than a convention.
 
+**Verified live 2026-09-17** on the board (`/dev/cu.usbserial-0001`, device name
+`Ziggy`, `10.0.0.114`), by publishing to `avatar/say` and reading the serial log.
+A negative control was included deliberately, so that a silent log means "parsed"
+rather than "nothing was watching":
+
+| Published | Serial output |
+|---|---|
+| `{"expression":"happy","led":"#ff8800","jingle":"Chime"}` | silent — all three v2 forms parse |
+| `{"expression":"Happy","led":"red","jingle":"chime"}` | silent — pre-v2 spellings still work |
+| `{"expression":"sleepy","led":"cycle"}` | silent |
+| `{"expression":"ecstatic","led":"#fff","jingle":"kazoo"}` | all three warned and fell back |
+
+Note the `#fff` case: shorthand hex is **not** accepted, by design. Both the
+typing/LED behaviour on the panels and the color accuracy of a mixed hex value
+were not checked by this test — it confirms parsing, not rendering.
+
 **Arbitrary colors are approximate, not calibrated.** The per-channel resistors
 are deliberately unmatched (see "RGB status LED" above), because the color dies
 have different forward voltages. Full-scale primaries look right; mixed colors

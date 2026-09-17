@@ -40,19 +40,33 @@ That split earns its keep in two places:
 
 ## Status
 
-Built and verified 2026-09-17:
+Built, deployed and verified on hardware 2026-09-17:
 
-- Firmware builds clean at 45.8% of the 3MB app partition. **Contract v2 is
-  written but not yet flashed** — the device was not plugged in. Until it is,
-  the device still runs the previous firmware, which ignores lowercase
-  expressions and hex colors.
-- API verified end-to-end against the real broker on osmo: publishes valid
-  contract v2 payloads, paces them, dedupes by key, and lets a high-priority
-  message overtake queued ambient ones.
+- **Contract v2 is flashed and verified on the device** (`Ziggy`, `10.0.0.114`).
+  Firmware is at 45.8% of the 3MB app partition. Checked against serial with a
+  negative control, so silence means parsed rather than merely unobserved:
+
+  | Payload | Serial |
+  |---|---|
+  | `happy` + `#ff8800` + `Chime` | silent — v2 forms all parse |
+  | `Happy` + `red` + `chime` | silent — the old spellings still work |
+  | `sleepy` + `cycle` | silent |
+  | `ecstatic` + `#fff` + `kazoo` | all three warned and fell back |
+
+  The `#fff` rejection is deliberate: only the exact 6-digit form parses, so a
+  typo warns instead of being guessed at.
+- **`services/api` is deployed on osmo** (`mqttchan-api`, port 8420) and
+  connected to the broker. Verified publishing valid v2 payloads with pacing,
+  dedupe by key, and high-priority messages overtaking queued ambient ones.
+- **The Python `avatar-brain` container has been stopped and removed** from
+  osmo. Its source directory is left at `~/avatar-brain` there, so the
+  decommission is reversible.
 - 32 unit tests passing across the API and feed-kit.
 
-No real data source is connected yet. The first one will be Home Assistant
-temperature readings — see [`services/README.md`](services/README.md).
+No real data source is connected yet — `feeds/example` is a template and is left
+disabled behind a compose profile, so the device stays quiet. The first real feed
+will be Home Assistant temperature readings; see
+[`services/README.md`](services/README.md).
 
 ## Deploy
 

@@ -213,7 +213,7 @@
       <select v-model="expression">
         <option v-for="e in expressions" :key="e.value" :value="e.value">{{ e.label }}</option>
       </select>
-      <button :disabled="!connected" @click="send">Send</button>
+      <button :disabled="!connected || sendBusy" @click="send">Send</button>
     </div>
     <div class="row">
       <select v-model="ledMode">
@@ -415,6 +415,16 @@ createApp({
     const ledBlink = ref(false);
     const jingle = ref("");
     const lastSent = ref("");
+
+    // Debounce the Send button: a BLE write or MQTT publish takes long enough
+    // that an impatient double-click queues a second identical message, and the
+    // device plays the jingle and re-renders for each one. sending covers the
+    // in-flight write, cooling the short quiet period after it.
+    const sending = ref(false);
+    const cooling = ref(false);
+    const SEND_COOLDOWN_MS = 600;
+    let coolTimer = null;
+    const sendBusy = computed(() => sending.value || cooling.value);
 
     // pass_ is intentionally never populated from a device read (see
     // ble_config.h's ConfigReader) - it's write-only, so it always starts
@@ -622,7 +632,8 @@ createApp({
     }
 
     async function send() {
-      if (!connected.value) return;
+      if (!connected.value || sending.value || cooling.value) return;
+      sending.value = true;
       const payload = JSON.stringify({
         text: text.value,
         expression: expression.value,
@@ -636,6 +647,11 @@ createApp({
         lastSent.value = payload;
       } catch (err) {
         setStatus("send failed: " + err.message, "error");
+      } finally {
+        sending.value = false;
+        cooling.value = true;
+        clearTimeout(coolTimer);
+        coolTimer = setTimeout(() => { cooling.value = false; }, SEND_COOLDOWN_MS);
       }
     }
 
@@ -645,7 +661,7 @@ createApp({
       connect, disconnect,
       text, expression, expressions: EXPRESSIONS, ledBlink,
       ledMode, ledHex, ledValue, ledModes: LED_MODES,
-      jingle, jingles: JINGLES, lastSent, send, textSizes: TEXT_SIZES,
+      jingle, jingles: JINGLES, lastSent, send, sendBusy, textSizes: TEXT_SIZES,
       settings, saving, saveStatusText, saveStatusClass, saveSettings,
       tzOptions,
     };
