@@ -61,12 +61,25 @@ Built, deployed and verified on hardware 2026-09-17:
 - **The Python `avatar-brain` container has been stopped and removed** from
   osmo. Its source directory is left at `~/avatar-brain` there, so the
   decommission is reversible.
-- 32 unit tests passing across the API and feed-kit.
+- 52 unit tests passing across the API, feed-kit and the flights feed.
 
-No real data source is connected yet — `feeds/example` is a template and is left
-disabled behind a compose profile, so the device stays quiet. The first real feed
-will be Home Assistant temperature readings; see
+**The first real feed is written: `feeds/flights`**, which announces arrivals
+and departures at ZQN from live ADS-B. It is wired into `docker-compose.yml`
+but **has not been deployed to osmo yet** — nothing is running it, so the
+device is still quiet. Built and verified 2026-09-18 against a real landing —
+a captured 15-snapshot approach (ANZ611 descending 5550ft at 11.8nm through to
+on-the-ground at 0.27nm) replayed through the detector
+announces `ANZ611 landed at ZQN` exactly once, and stays silent either side of
+it. Not yet seen live: a departure, which is the same edge in reverse and is
+unit-tested but had no traffic to confirm it against.
+
+**Correction, 2026-09-18:** this section previously said the first real feed
+would be Home Assistant temperature readings. That was the plan and the HA
+research had already been done; the flights feed was simply what got built
+first. The HA work is still queued and still valid — see
 [`services/README.md`](services/README.md).
+
+`feeds/example` remains a template, left disabled behind a compose profile.
 
 ## Deploy
 

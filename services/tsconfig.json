@@ -4,6 +4,7 @@
     { "path": "./packages/contract" },
     { "path": "./packages/feed-kit" },
     { "path": "./api" },
-    { "path": "./feeds/example" }
+    { "path": "./feeds/example" },
+    { "path": "./feeds/flights" }
   ]
 }

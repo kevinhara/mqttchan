@@ -8,6 +8,7 @@ packages/contract   the feed <-> API interface (shared types + JSON schema)
 packages/feed-kit   the client, poll loop and change tracking every feed needs
 api                 triage, rate limiting, and the MQTT connection
 feeds/example       a template feed, not a real integration
+feeds/flights       arrivals and departures at ZQN, from live ADS-B
 ```
 
 ## The idea
@@ -94,7 +95,21 @@ ssh kevin@osmo 'cd ~/mqttchan-services && docker compose up -d --build'
 
 Copy `.env.example` to `.env` on the host and `chmod 600` it.
 
-## Next: the Home Assistant temperature feed
+## The ZQN flights feed
+
+`feeds/flights` announces arrivals and departures at Queenstown from live
+ADS-B. Built and verified against a real landing on 2026-09-18; see
+[`feeds/flights/README.md`](feeds/flights/README.md) for how a movement is
+detected, the four rules that stop false positives, and two undocumented
+adsb.lol behaviours that will otherwise cost you an hour.
+
+## Still to do: the Home Assistant temperature feed
+
+**Changed 2026-09-18:** this section used to read "Next: the Home Assistant
+temperature feed", and the top-level README called it the first real feed.
+`feeds/flights` was built first instead — it was simply what got asked for. The
+research below was done on 2026-09-17 and still stands; nothing about it was
+wrong, it just is not next any more.
 
 Verified against live HA on 2026-09-17, so it doesn't need rediscovering:
 

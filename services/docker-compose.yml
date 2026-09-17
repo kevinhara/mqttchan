@@ -26,3 +26,19 @@ services:
       API_URL: http://api:8420
     command: ["node", "feeds/example/dist/index.js"]
     profiles: ["example"]
+
+  # Arrivals and departures at ZQN, from live ADS-B. The airport is env-driven;
+  # these three variables are the whole of "in this case, Queenstown".
+  feed-flights:
+    image: mqttchan-services
+    container_name: mqttchan-feed-flights
+    restart: unless-stopped
+    depends_on: [api]
+    env_file: .env
+    environment:
+      API_URL: http://api:8420
+      AIRPORT_CODE: ZQN
+      AIRPORT_LAT: "-45.0211"
+      AIRPORT_LON: "168.7392"
+      POLL_INTERVAL_MS: "60000"
+    command: ["node", "feeds/flights/dist/index.js"]
