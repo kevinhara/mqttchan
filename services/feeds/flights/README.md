@@ -80,6 +80,12 @@ lat/lon + radius, not local SDR hardware". airplanes.live serves the same
   of the same airframe's same movement `deduped`. `kind: "notice"` is accepted
   by triage as-is.
 
-Not yet verified: a **departure** against live data — the logic is the same
-edge in reverse and is unit-tested, but no aircraft left ZQN during the window
-this was built in. Worth confirming from the logs on the first busy morning.
+**Departure confirmed live 2026-09-18**, 09:20 NZST: `ZKICH left ZQN`,
+published from the deployed container within twenty minutes of the stack coming
+up. `flights` recorded submitted 1 / queued 1 / published 1 — no duplicate from
+the aircraft's subsequent climb snapshots, nothing dropped, queue drained. This
+replaces an earlier note here saying a departure had only unit tests behind it;
+it was accurate when written and is now superseded.
+
+Still unobserved in production: the cooldown and the 45-minute expiry actually
+firing, since neither has had a circuit or a coverage dropout to act on yet.

@@ -63,15 +63,24 @@ Built, deployed and verified on hardware 2026-09-17:
   decommission is reversible.
 - 52 unit tests passing across the API, feed-kit and the flights feed.
 
-**The first real feed is written: `feeds/flights`**, which announces arrivals
-and departures at ZQN from live ADS-B. It is wired into `docker-compose.yml`
-but **has not been deployed to osmo yet** — nothing is running it, so the
-device is still quiet. Built and verified 2026-09-18 against a real landing —
-a captured 15-snapshot approach (ANZ611 descending 5550ft at 11.8nm through to
-on-the-ground at 0.27nm) replayed through the detector
-announces `ANZ611 landed at ZQN` exactly once, and stays silent either side of
-it. Not yet seen live: a departure, which is the same edge in reverse and is
-unit-tested but had no traffic to confirm it against.
+**The first real feed is live: `feeds/flights`**, which announces arrivals and
+departures at ZQN from live ADS-B. Deployed to osmo as `mqttchan-feed-flights`
+and **confirmed end to end on real traffic 2026-09-18**: at 09:20 NZST it
+published `ZKICH left ZQN` — one message, no duplicate, queue drained, device
+connected throughout. The API paced and published it unchanged, and triage
+rendered `kind: "notice"` as
+`{"expression":"happy","led":"#3399ff","blink":false,"jingle":"chime"}`.
+
+The detector was also validated offline against a real arrival before deploy: a
+captured 15-snapshot approach (ANZ611 descending 5550ft at 11.8nm through to
+on-the-ground at 0.27nm), replayed, announces `ANZ611 landed at ZQN` exactly
+once and stays silent either side of it.
+
+**Correction, 2026-09-18 (same day):** the line above briefly said a departure
+was "not yet seen live", which was true for about twenty minutes after deploy.
+`ZKICH left ZQN` settled it. Both directions of the edge are now confirmed
+against real aircraft, which is worth stating plainly because the departure
+path is the one that had only unit tests behind it.
 
 **Correction, 2026-09-18:** this section previously said the first real feed
 would be Home Assistant temperature readings. That was the plan and the HA
