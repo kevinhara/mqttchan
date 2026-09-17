@@ -1,0 +1,28 @@
+# API and feeds are one stack, so unlike the rest of the homelab (a directory
+# and a compose file per service, published to a host port and addressed by
+# osmo's LAN IP) they share a compose network here. Feeds reach the API at
+# http://api:8420 and have no reason to be reachable from outside the stack, so
+# only the API publishes a port - and that only for debugging and curl.
+services:
+  api:
+    build: .
+    image: mqttchan-services
+    container_name: mqttchan-api
+    restart: unless-stopped
+    ports:
+      - "8420:8420"
+    env_file: .env
+    command: ["node", "api/dist/index.js"]
+
+  # A template, not a real integration. Left disabled so a fresh deploy is
+  # quiet; remove the profile to run it, or copy it to start a real feed.
+  feed-example:
+    image: mqttchan-services
+    container_name: mqttchan-feed-example
+    restart: unless-stopped
+    depends_on: [api]
+    env_file: .env
+    environment:
+      API_URL: http://api:8420
+    command: ["node", "feeds/example/dist/index.js"]
+    profiles: ["example"]

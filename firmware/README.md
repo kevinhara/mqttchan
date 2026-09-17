@@ -1,0 +1,649 @@
+# mqttchan firmware
+
+**Moved 2026-09-17** from the repository root into `firmware/`, when the
+firmware, the broker config and the new TypeScript services were collapsed into
+one monorepo. Nothing in the build changed — but **the flash command is now
+`cd firmware && pio run -t upload`**, not `pio run -t upload` from the repo root.
+Paths quoted throughout this file (`include/...`, `src/...`) are still relative
+to this directory and remain correct; `../docs/index.html` is the exception,
+since the control page stays at the repo root for GitHub Pages.
+
+This file used to be titled "avatar-demo", after the project this started as.
+The device is called mqttchan; `avatar/say` remains the MQTT topic, and
+`m5stack-avatar` remains the rendering library.
+
+[stack-chan/m5stack-avatar](https://github.com/stack-chan/m5stack-avatar) running
+on a bare ESP-WROOM-32 with a 128x64 SSD1306 I2C OLED — no M5Stack hardware
+involved. A second SSD1306 shows what's "said" as a word-wrapped speech
+bubble (see "The speech bubble" below) — optional, and everything below runs
+fine without it wired up.
+
+By default the board joins WiFi, subscribes to an MQTT topic, and drives the
+avatar + bubble from whatever `{"text":..., "expression":...}` JSON arrives
+(see "MQTT-driven mode" below) — this is meant to run against the `services/api`
+layer in this repo, not standalone. (It previously ran against a Python
+`avatar-brain` service in the homelab; that has been superseded — see the root
+README.)
+Build with `-DAVATAR_DEMO_MODE` instead to get the old self-cycling bench
+demo (cycles the six built-in expressions, fakes lip-sync babble on every
+third one) with no network required.
+
+Verified live 2026-09-14 on ESP32-D0WDQ6 rev v1.0 (`/dev/cu.usbserial-0001`):
+demo mode renders all six expressions correctly, heap flat at ~295 KB across
+9 cycles, no reboots. MQTT mode verified the same day via the headless bench
+test described below (no live broker was up yet): WiFi correctly times out
+and retries rather than hanging when `secrets.h` has placeholder credentials,
+and a synthetic payload correctly renders both the Happy expression and a
+two-line-wrapped bubble.
+
+## Core split
+
+This was the reason for building it — the avatar gets one core, the other
+stays free for application work.
+
+| Core | Owner | What runs there |
+|---|---|---|
+| 1 (`APP_CPU`) | the avatar | `drawLoop` + `facialLoop` (blink, saccade, breath) |
+| 0 (`PRO_CPU`) | you | `appTask` — triggers, TTS, LLM calls, network |
+
+The library already does most of this: `Avatar::start()` hardcodes both of its
+tasks to `APP_CPU_NUM`, so no patching was needed. The part that *is* on us is
+that Arduino's `loop()` also runs on core 1 — so `loop()` is deliberately left
+empty and all app logic goes in `appTask`, pinned to `PRO_CPU_NUM`. Putting
+work in `loop()` would quietly land it on the avatar's core and fight the
+renderer for time.
+
+Cross-core calls into the avatar are safe for what the demo uses:
+`setExpression()` suspends the draw task before mutating, and the float
+setters (`setMouthOpenRatio`, gaze, breath) are single-word writes the draw
+task only reads.
+
+## Wiring
+
+Two SSD1306 panels, **each on its own I2C bus** — they don't share pins:
+
+| Panel | SDA | SCL | VCC | GND | Bus |
+|---|---|---|---|---|---|
+| Face (`oled`) | GPIO32 | GPIO33 | 3V3 | GND | software (bit-banged) I2C |
+| Bubble (`oledText`) | GPIO4 | GPIO15 | 3V3 | GND | hardware I2C port 1 |
+
+Both panels answer at the default address **0x3C** — no jumper needed, since
+they're on physically separate buses and there's nothing to collide with.
+
+**Corrected 2026-09-15:** this table used to pair Face with GPIO4/15
+(hardware bus) and Bubble with GPIO32/33 (bit-banged) — the two physical
+panels turned out to be mounted reversed relative to that wiring, so content
+was landing on the wrong screen. `main.cpp` now builds `oled` on the
+GPIO32/33 pins and `oledText` on GPIO4/15 instead (see the comment above
+their declarations), which is the swap reflected in the table above. The
+GPIO-level facts below (which pins to avoid and why) are about the physical
+pins themselves and didn't change — only which panel/content each pin pair
+drives did. Net effect: the avatar now runs on the slower 400kHz bit-banged
+bus instead of the 800kHz hardware one; re-wiring instead of swapping in
+software would recover that speed, but wasn't done here.
+
+**Do not move GPIO4 (now the bubble panel's SDA) to GPIO2.** GPIO2 is a
+boot-strapping pin; the OLED's pull-up on it holds the ESP32 out of USB
+download mode (`Wrong boot mode detected (0x1b)`) and flashing fails whenever
+the display is attached. Same lesson the sibling `hello-world` panel learned
+on 2026-09-14. Port 1 (now the bubble panel's bus) is likewise deliberate:
+M5Unified's `begin()` claims port 0 for its own PortA devices, and sharing it
+means two drivers reconfiguring one peripheral with different pins.
+
+**Why one panel is on GPIO32/33 instead of a second hardware port:** the
+ESP32 classic only has two hardware I2C peripherals, and both are already
+spoken for (port 0 by M5Unified, port 1 by the other OLED panel).
+`SSD1306Display` in `ssd1306_display.h` passes its `i2c_port` argument
+straight through to LGFX's `Bus_I2C`, which treats a **negative** port number
+as a request for its bit-banged software I2C path (`soft_i2c.inl`) on
+whatever GPIOs you give it — so `oled` in `main.cpp` is constructed with port
+`-1` and pins 32/33. GPIO32/33 were picked because they're not
+boot-strapping pins, not the SPI-flash pins (6-11), and not already claimed
+by the other OLED panel or M5Unified. Clocked at 400kHz rather than the
+hardware bus's 800kHz, since bit-banged timing is CPU-cycle-bound and less
+forgiving at high speed.
+
+## RGB status LED
+
+A 4-pin RGB LED (3 color legs + 1 common leg), wired straight to the ESP32 —
+no driver board, just a resistor per color leg.
+
+| Leg | GPIO | Resistor |
+|---|---|---|
+| Red | GPIO25 | ~150–220Ω |
+| Green | GPIO26 | ~220–330Ω |
+| Blue | GPIO14 | ~220–330Ω |
+| Common | GND | none |
+
+**Verified live 2026-09-16** on the same `/dev/cu.usbserial-0001` board:
+wired common-cathode (common leg to GND), all three legs confirmed against
+their GPIO via the `RGB_LED_TEST` build below — red/green/blue/off cycle and
+a full HSV spectrum sweep both rendered the correct colors with no cross-talk
+between channels.
+
+**Put one resistor per color leg, not one shared resistor on the common
+leg.** Each color die has a different forward voltage (red ≈2.0V,
+green/blue ≈3.0V at 3.3V logic), so a single shared resistor over- or
+under-drives whichever color has a different Vf, unevenly across channels.
+The common leg itself needs no resistor — it's just the return path.
+
+**This board is a 30-pin ESP32 devkit — GPIO16/17 aren't broken out**, unlike
+on 38-pin boards where they usually are. GPIO25/26/14 were picked instead:
+all three drive over LEDC PWM, and none collide with the OLED buses
+(GPIO4/15, GPIO32/33), the piezo (GPIO27), the boot-strapping pins
+(0/2/5/12), or M5Unified's reserved PortA pins (21/22 — see the comment in
+`ssd1306_display.h`).
+
+**If the LED turns out common-anode instead** (common leg to 3V3, not GND),
+don't rewire it — `#define RGB_COMMON_ANODE` above the pin defines in
+`main.cpp` inverts the PWM duty cycle in software instead.
+
+**Building/rewiring on a breadboard-free case:** with Dupont jumpers jammed
+straight into the 3D-printed case rather than a breadboard, splice each
+resistor into its own jumper wire (cut a female-to-female wire in half,
+twist/solder the resistor lead to the bared end, heat-shrink the joint) —
+keeps the same connector style as the rest of the wiring rather than
+introducing a different mechanical fit.
+
+A standalone wiring-test build lives behind a flag rather than in the real
+app, same pattern as `AVATAR_DEMO_MODE`/`AVATAR_FB_DUMP` below — see
+`RGB_LED_TEST` in `main.cpp`. Build/flash it with:
+
+```
+PLATFORMIO_BUILD_FLAGS="-D RGB_LED_TEST" pio run -e esp32dev -t upload
+```
+
+It replaces `setup()`/`loop()` entirely (no WiFi/MQTT/avatar involved):
+cycles red → green → blue → off at full brightness (0.7s each, with serial
+prints), then sweeps a full 360° HSV rainbow at ~15ms/step. Reflash without
+the flag (`pio run -e esp32dev -t upload`) to return to the real app.
+
+**In the real (non-`RGB_LED_TEST`) app, the LED is message-driven.** A
+message payload's optional `"led"` field (`"red"`/`"green"`/`"blue"`/
+`"cycle"`) and optional `"blink"` boolean (default `false`) — see "MQTT-driven
+mode" below — light `include/rgb_led.h`'s `RgbLed` for exactly as long as
+that message is on the bubble panel (typing + hold, or indefinitely under
+`keepLastMessage`), then it turns off along with the bubble reverting to the
+idle clock. `"cycle"` sweeps the same HSV rainbow as the wiring test above;
+`"blink"` toggles whatever color is active (solid or cycling) on/off every
+400ms. An unrecognized `"led"` string logs a warning and leaves the LED off
+for that message, same "falls back rather than fails" treatment as an
+unrecognized `"expression"`. Not yet verified live against a real message
+flow — the wiring test above confirmed the physical LED itself, but this
+message-driven path has only been build-verified so far.
+
+## The speech bubble (second panel)
+
+`include/speech_bubble.h`'s `SpeechBubble` class draws a bordered,
+word-wrapped text box to a second panel — `oledText` in `main.cpp` — kept
+completely separate from the avatar's own `M5.Display`. Text is revealed one
+character at a time (`show()`'s `charDelayMs`, default 25ms/char) rather than
+appearing all at once, so it reads as the character actually talking. This
+blocks `appTask` for the reveal's duration (~strlen * charDelayMs) — fine
+here since nothing else needs that core's attention mid-phrase, but worth
+knowing if something latency-sensitive ever gets added to the same task.
+`appTask` calls `bubble->show(...)` with a canned phrase alongside each
+expression change; swap that call for real TTS output text and nothing else
+needs to change. The canned phrases (`kPhrases` in `main.cpp`) are nihilistic
+one-liners — a demo bubble should at least be funny.
+
+Status: verified live 2026-09-14 on real hardware (both failure and success
+paths). With no second panel attached, `setup()` logged `Second SSD1306
+(text) init failed` exactly as designed and the avatar kept cycling normally
+on the first panel. With the second panel wired to GPIO32/33 per Wiring above,
+the framebuffer dump (`dumpBubbleFramebuffer`, under `-DAVATAR_FB_DUMP`)
+confirmed the rounded-rect border draws correctly and word-wrap works: short
+phrases ("Great to see you!") render on one line, and the longest phrase
+("Feeling kind of blue.") correctly wraps to two lines without overlap.
+
+**Message text size is configurable** (`SpeechBubble::setTextSize()`,
+persisted as `DeviceSettings::messageTextSize`/`textSize` over BLE): "Small"
+(the original size, value `1`) is the default, "Large" (value `2`) doubles
+both glyph dimensions. Changeable from the control page's Messaging settings
+group (`../docs/index.html`) same as message hold time/keep-last-message; takes
+effect on the next message shown, not retroactively on whatever's already on
+screen. Not yet verified live — build-verified only so far, unlike the rest
+of this section.
+
+## How it was made to work on a non-M5 panel
+
+Two problems had to be solved; both are worth knowing before editing this.
+
+**1. The avatar only draws to `M5.Display`.** `Face.cpp` references `M5.Lcd` /
+`M5.Display` directly — there is no "render to an arbitrary canvas" entry
+point. So the fix is to make M5Unified's primary display *be* the SSD1306.
+M5GFX ships `lgfx::Panel_SSD1306` but no device wrapper for it (only
+`M5UnitOLED`, which is an SH110x 64x128), so `include/ssd1306_display.h` is
+that wrapper, written to the same shape as M5GFX's own `M5UnitOLED.h`. It is
+attached with `M5.addDisplay()` + `M5.setPrimaryDisplay()`.
+
+Ordering is load-bearing: **each panel's `.init()` must come after
+`M5.begin()`.** `M5.begin()` runs M5GFX board autodetect, which probes SPI
+pins — GPIO15 among them. Since the 2026-09-15 pin swap (see Wiring above),
+GPIO15 is `oledText`'s SCL, not `oled`'s, so this now bears on
+`oledText.init()` rather than `oled.init()` — but both already run after
+`M5.begin()`, so the requirement is satisfied either way. Initialising a
+panel afterwards re-owns whatever pins it uses and sends the SSD1306 its full
+reset sequence. The other order leaves the panel blank.
+
+**2. The stock face is drawn for a 320x240 canvas.** `m5avatar::Face` puts the
+eyes at x=90/230 and the mouth at y=148; the library's own `faces/OledFace.h`
+is in the same coordinate space despite its name, so it is not the answer
+here. Using `Avatar::setScale()` to shrink 320x240 into 128x64 works but looks
+bad — on a 1-bit panel there is no grey to antialias a downscale into, so the
+eyes come out as ragged blobs. `include/small_oled_face.h` instead authors the
+geometry at 1:1 for 128x64.
+
+When editing that geometry: every position is the **centre** of its part, not a
+corner, and `BoundingRect` takes **(top, left)** — y first. `Eye` reads
+`getCenterX/Y()` while `Mouth` and `Eyeblow` read `getLeft/getTop()`; the
+two-arg `BoundingRect` leaves width/height at 0, which is what makes those
+agree.
+
+## Seeing what the panel shows, without looking at it
+
+Build with `-DAVATAR_FB_DUMP` and the panel framebuffer gets dumped to serial
+as ASCII art (`Panel_HasBuffer` keeps a readable RAM copy, so this reads back
+what was actually rasterised, not what was intended) — after each expression
+change in demo mode, or once after the synthetic bench-test payload in MQTT
+mode (see "MQTT-driven mode" above). It costs nothing when the flag is off,
+which is the default. This is how every "verified live" claim in this file
+was checked.
+
+```
+pio run -t upload                                              # MQTT mode (default)
+PLATFORMIO_BUILD_FLAGS="-DAVATAR_DEMO_MODE" pio run -t upload   # demo mode, no network
+PLATFORMIO_BUILD_FLAGS="-DAVATAR_FB_DUMP" pio run -t upload     # + framebuffer dump
+```
+
+Note `pio device monitor` fails in a non-TTY shell (`termios.error: (19,
+Operation not supported by device)`) — read the port with pyserial instead.
+
+## Boot screen and splash
+
+Every power-up now opens with the HLI boot POST + splash intro — ported
+verbatim from `~/Code/esp32_oled/HLI` (`include/boot.h`+`src/boot.cpp`,
+`include/splash.h`+`src/splash.cpp`, `include/ui.h`+`src/ui.cpp`,
+`include/brand.h`) — before `M5.begin()` hands both panels to the avatar and
+the clock. Both are pure functions of elapsed ms plus a `U8G2&`, with no
+app/network dependency, so they carried over unmodified; only `main.cpp`
+changed.
+
+**Splash plays on the face/top panel, POST plays on the bubble/bottom
+panel, concurrently** — not the same sequence on one panel, back to back.
+The synthwave splash is the flashy full-frame graphic, so it runs where the
+avatar lives afterward; the POST is scrolling console text, so it runs where
+the clock's own text lives afterward. Two separate `U8G2` instances in
+`main.cpp` do this: `u8g2Face` (hardware I2C, same GPIO4/15 as `oled`) draws
+`splash::draw()`, `u8g2Boot` (software/bit-banged I2C, same GPIO32/33 as
+`oledText`) draws `boot::draw()`, both inside one `while` loop in `setup()`.
+Because POST (6.47s) outlasts the splash intro (4.78s), the loop keeps
+running boot alone for the last ~1.7s while the splash side just holds its
+settled final frame — total added boot time is POST's own length, not the
+sum of both.
+
+They draw through U8g2's own I2C drivers rather than through
+`ssd1306_display.h`'s LGFX wrapper: porting `boot.cpp`/`splash.cpp`'s ~40 raw
+`U8G2` draw calls (XOR bars, dot leaders, a hand-drawn 32px glyph, the
+5x-pixel outrun grid) to LGFX wasn't worth it for a sequence that plays once
+and hands off.
+
+**Two different I2C drivers share each pair of pins, one after the other,
+not at once.** `u8g2Face`'s Arduino HW-I2C backend drives GPIO4/15 via
+`Wire` (I2C_NUM_0); `SSD1306Display` (`oled`) drives the same pins via
+LGFX's `Bus_I2C` on I2C_NUM_1. `Wire.end()` right after the boot/splash loop
+releases I2C_NUM_0 before `M5.begin()` + `oled.init()` reclaim the pins on
+I2C_NUM_1 — the same "ordering is load-bearing, pins get re-owned" pattern
+the M5.begin()-then-oled.init() sequence below already relies on, just one
+hop earlier. `u8g2Boot`'s software I2C on GPIO32/33 needs no equivalent
+release: bit-banging is plain `digitalWrite()`, so there's nothing left
+running for `oledText.init()` to contend with once the loop exits.
+
+`olikraus/U8g2 @ ^2.35.30` was added to `lib_deps` for this.
+
+**Correction, 2026-09-15:** this section originally said the single `u8g2`
+instance was built at `U8G2_R2` "to match `M5.Display.setRotation(2))`" and
+that boot+splash ran sequentially on one panel over ~11.2s. Both were wrong
+in ways only visible with eyes on the actual panel: U8g2's rotation and
+LGFX's `rotation(2)` don't agree for this SSD1306 driver/panel combination,
+so `U8G2_R2` rendered upside down despite matching the avatar's own
+rotation — `U8G2_R0` is correct here. And splitting boot/POST onto their own
+panels (this section, same date) made "sequential on one panel" moot. The
+old reading was believable because U8g2's `U8G2_R2` and LGFX's
+`setRotation(2)` share the same "180 degrees" name; they just don't rotate
+the same panel the same way.
+
+**A single DOS-BIOS-style POST beep** fires on the piezo (`PIEZO_PIN`,
+GPIO27) the instant the POST side finishes — `tone(PIEZO_PIN, 1000, 150)` in
+`main.cpp`'s boot/splash loop, gated on a `posted` flag so it fires exactly
+once regardless of how much longer the splash side keeps running. This is
+the classic "self test passed, handing off to the bootloader" chime
+(AMI/Award BIOSes: one short beep = good), not a beep per POST line — real
+BIOSes are silent through the self test and only speak once, at the end.
+
+Verified live 2026-09-15 on the same board as above: `pio run` builds clean
+at 45.5% flash / 19.9% RAM (up ~0.1% from the single-panel version above —
+the second `U8G2` instance costs one more small framebuffer + driver
+instantiation, nothing more). `pio run -t upload` flashed successfully.
+Three separate DTR/RTS-reset serial captures landed "WiFi: connecting..."
+at 14.87-14.88s (down from the old sequential design's ~17.5s, consistent
+with POST-only being ~4.8s shorter than POST+splash-in-series). One of the
+three captures crashed instead, at the MQTT-connect step, on an lwIP assert
+(`udp_new_ip_type ... Required to lock TCPIP core functionality`) — nothing
+in this change touches networking, and the other two resets (before and
+after it) completed cleanly, so this reads as pre-existing intermittent
+flakiness rather than something introduced here, but it's noted rather than
+swept under the rug in case it recurs. The panel's actual pixels weren't
+eyeballed as part of this check (no camera on this session) — worth a glance
+next power-up to confirm the split/orientation actually reads as intended,
+given the rotation correction above came from exactly that kind of miss.
+
+**Correction, 2026-09-16: the beep now fires at the *start* of POST, not the
+end.** The paragraph above described a single beep firing "the instant the
+POST side finishes," modeled on the AMI/Award "self-test passed" chime at
+hand-off to the bootloader. On reflection the beep these old boot screens are
+actually remembered for is the one that opens the self test, not the one that
+closes it, so `main.cpp`'s boot loop now fires `tone(PIEZO_PIN, 1000, 150)`
+once, immediately after `boot::begin()` and before the loop's first
+`boot::draw(u8g2Top)` call — not when `boot::done()` goes true. `bootDone`/
+`bootDoneAt` still exist and still gate `PHASE_HOLD_MS`; they just no longer
+also gate the beep. Not re-verified live since this only moves *when* an
+already-verified `tone()` call fires, not what it does.
+
+**Correction/update, 2026-09-16:** three more changes, made on feedback from
+actually looking at the panel — proof the "worth a glance" note above was
+right to flag.
+
+- **POST and splash swapped panels.** POST now plays on the top/face panel
+  (`u8g2Top`, was `u8g2Face`), splash on the bottom/bubble panel
+  (`u8g2Bottom`, was `u8g2Boot`) — the reverse of what this section said
+  above. The two `U8G2` instances in `main.cpp` are now named for physical
+  position, not content, since content has already moved once.
+- **The loop no longer freezes either sequence once it individually
+  finishes.** Previously, `splash::draw()` only got called while
+  `splash::intro()` was true, so once its 4.78s intro ended (before POST's
+  6.47s did) it froze on the settled title-card frame instead of falling
+  into its own attract loop (kicker lines cycling, scan bar sweeping).
+  Both sides now draw every frame unconditionally, and a `POST_HOLD_MS`
+  (2000ms) constant keeps the loop running for a further beat once *both*
+  are done, specifically so that attract-loop motion — and POST's cursor
+  still blinking — are actually visible before `M5.begin()` takes the
+  panels, rather than the app moving on the instant the longer sequence's
+  one-shot ends.
+- **POST's console font changed** from `u8g2_font_4x6_tf` to
+  `u8g2_font_5x8_tf`, to match mqttchan's own "message screen"
+  (`SpeechBubble`'s font — LGFX's default, the classic 5x7-glyph/6x8-cell
+  GLCD font, see `speech_bubble.h`) instead of the original HLI source
+  project's tighter one. This shrank the console grid from 32x10 to 25x8
+  (`ui.h`'s `CW`/`CH`/`COLS`/`ROWS`); every existing BIOS/POST line in
+  `brand.h` already fit under the new 25-column limit without editing
+  (longest is exactly 25). Splash's own kicker-line font is untouched —
+  still 4x6 — so `splash.cpp`'s one call that used to reuse `ui::CH` for
+  its static-noise band height now uses a literal `6` instead, so it didn't
+  drift when the shared constant it borrowed changed size for an unrelated
+  reason.
+
+Verified live 2026-09-16 on the same board: `pio run` builds clean at 45.5%
+flash / 19.9% RAM (unchanged from the numbers above to one decimal place).
+`pio run -t upload` flashed successfully; a DTR/RTS-reset serial capture
+landed "WiFi: connecting..." at 17.89s (up from 14.87-14.88s above by
+almost exactly `POST_HOLD_MS`'s 2000ms, as expected), then through to "MQTT:
+connected and subscribed" / "BLE: advertising" with no crash. Panel pixels
+still weren't eyeballed this round either (still no camera on this
+session) — this entire update exists *because* a human did look at the
+previous round, so that glance is doubly worth doing again here.
+
+**Correction, 2026-09-15: the two physical panels turned out to be mounted
+reversed** relative to all of the pin numbers above — a hardware fact, not a
+content-placement choice like the 2026-09-16 swap above. `u8g2Top` and `oled`
+(the "top/face" role) now run on GPIO32/33 (software/bit-banged I2C, so
+`u8g2Top` changed from the `HW_I2C` template to `SW_I2C`); `u8g2Bottom` and
+`oledText` (the "bottom/bubble" role) now run on GPIO4/15 (hardware I2C, so
+`u8g2Bottom` changed the other way). See the Wiring section above for the
+corrected pin table and the trade-off this introduces (the avatar now
+animates over the slower bit-banged bus). `u8g2Top`/`u8g2Bottom` keep their
+physical-position names and still draw the same content (POST on top, splash
+on bottom) as the 2026-09-16 section above describes — only the electrical
+pins underneath moved. Not yet re-verified live on hardware; flash and check
+both the boot sequence and the running avatar/bubble land on the intended
+physical screen before trusting this.
+
+**Correction/update, 2026-09-15 (later the same day): boot and splash are no
+longer concurrent, and splash now plays a synthwave riff on the piezo.**
+Three changes, on top of the physical-panel-reversal correction just above:
+
+- **The shared `while` loop is gone.** `setup()` now runs POST and splash as
+  two fully separate phases — POST alone on `u8g2Top` first, then (once
+  `boot::done()`) splash alone on `u8g2Bottom` — rather than drawing both to
+  one shared frame clock. This turned out to be why *both* were reported
+  janky, not just the slower panel: sharing one loop meant each sequence's
+  own animation was throttled down to whatever pace the loop as a whole
+  could sustain, which was however long the slower panel's send took,
+  regardless of how fast the other one's own bus was. Whichever panel isn't
+  currently playing is blanked rather than drawn to for no reason.
+- **`u8g2Top` (POST, now on GPIO32/33 after the pin-reversal fix above) moved
+  off U8g2's software I2C onto the ESP32's second hardware I2C peripheral**
+  (`Wire1`), via U8g2's `_2ND_HW_I2C` constructor variant and a new
+  `-D U8X8_HAVE_2ND_HW_I2C` build flag in `platformio.ini` (without that flag
+  the constructor is a silent no-op — U8g2 only defines the macro itself on
+  boards that declare `WIRE_INTERFACES_COUNT > 1`, which `esp32dev` doesn't).
+  U8g2's own software I2C bit-bangs through `digitalWrite()` per bit, which
+  is slow enough that sending one 1024-byte frame plausibly took tens of
+  ms — independently of the shared-loop problem above, and the likely actual
+  cause of POST's own reported jank. `u8g2Bottom` (splash) didn't need this:
+  it already sits on GPIO4/15's real hardware peripheral (global
+  `Wire`/I2C_NUM_0). `Wire1.end()` releases the peripheral before `oled`
+  (LGFX, its own bit-banged path on the same GPIO32/33 pins) claims them at
+  runtime — this one isn't just hygiene the way `Wire.end()` for `Wire` is,
+  since a hardware peripheral left attached to those pins would otherwise
+  still be driving them alongside `oled`'s plain `digitalWrite()` bit-banging.
+- **Splash now plays a monophonic synthwave arpeggio on the piezo**
+  (`splash::playTheme()`, called from `main.cpp`'s splash phase alongside
+  `splash::draw()`) — the "retro cassette" half of a request to give the
+  intro more of that vibe; the visuals were already outrun/synthwave (the
+  sun, the grid, the neon skyline), and this is what makes it read as a tape
+  playing rather than just a screen lighting up. A minor pentatonic scale, a
+  slow rising phrase while the world assembles, a driving arpeggio through
+  the approach that quickens toward the slam, a hit on the slam, and two
+  resolving notes as the mark and kicker land — driven by an explicit stage
+  machine (`ThemeStage` in `splash.cpp`) rather than matching beats by time
+  window, since `T_MARK` falls inside the slam's own `[T_FLASH,
+  T_FLASH+D_FLASH)` window and a naive time-window match would double-fire
+  the slam beat instead of the mark beat.
+
+`pio run` builds clean at 45.6% flash / 19.9% RAM (consistent with the
+figures above).
+
+Verified live 2026-09-15: `pio run -t upload` flashed successfully. Two
+back-to-back DTR/RTS-reset serial captures both reached "WiFi: connected" →
+"MQTT: connected and subscribed" → "BLE: advertising" with no crash. One of
+the two captures logged a single early transient:
+`[900][E][esp32-hal-i2c-ng.c:275] i2cWrite(): i2c_master_transmit failed:
+[259] ESP_ERR_INVALID_STATE`, right around when `u8g2Top`'s POST console
+would be sending its first frames over the new `Wire1` path — the other
+capture didn't show it at all, so it's intermittent rather than
+deterministic, and in both runs the board carried on and booted cleanly
+regardless. Plausibly a one-off hiccup on `Wire1`'s very first transaction
+after `Wire1.begin()`, harmless in practice since U8g2 resends the whole
+POST frame every ~16ms anyway — a single dropped frame in a several-hundred-
+frame sequence would be invisible. **Not confirmed by eye yet** — this
+session has no camera, so whether POST/splash actually read as smooth, and
+whether that intermittent error ever shows up as a visible glitch on the
+panel, still wants an actual look at the hardware next time someone's near
+it. The synthwave riff likewise hasn't been listened to yet.
+
+## MQTT-driven mode
+
+Default build (no flags). `include/mqtt_link.h`'s `MqttLink` owns WiFi +
+MQTT: connects, subscribes to one topic, and on every message parses
+`{"text": "...", "expression": "...", "led": "...", "blink": ..., "jingle": "..."}` JSON and
+calls `avatar.setExpression()` + `bubble->show(text)` straight from the
+PubSubClient callback — safe here because that callback already runs inside
+`mqttLink.loop()` on core 0/`appTask`, the same task that owned those calls in
+demo mode, and `setExpression()` already suspends the draw task internally.
+No queue needed for a single-producer, single-consumer, already-single-task
+design.
+
+**Contract v2, 2026-09-17** — two fields changed. Both changes are backward
+compatible, so nothing that published to this device before needs updating.
+
+`"expression"` is now matched with `strcasecmp` rather than `strcmp`, so
+**lowercase is the canonical spelling** (`happy`, `angry`, `sad`, `doubt`,
+`sleepy`, `neutral`) and the capitalized forms still work. Previously a payload
+saying `"happy"` silently fell back to `Neutral` and logged a warning, which was
+an easy trap for a publisher to fall into.
+
+`"led"` and `"blink"` are both optional. `"led"` picks the RGB status LED's
+color for as long as this message is on screen. It used to be one of four fixed
+strings; it now accepts:
+
+| Value | Effect |
+|---|---|
+| `""` / omitted | LED stays off |
+| `"#RRGGBB"` (or `RRGGBB`) | any color — this is what the control page's picker sends |
+| `"cycle"` | slow HSV rainbow sweep, as before |
+| `"red"` / `"green"` / `"blue"` | kept as aliases for the full-scale primaries |
+
+Matching is case-insensitive. Only the exact 6-digit hex form parses — a short
+`#fff` logs a warning and leaves the LED off, rather than being guessed at.
+
+**Arbitrary colors are approximate, not calibrated.** The per-channel resistors
+are deliberately unmatched (see "RGB status LED" above), because the color dies
+have different forward voltages. Full-scale primaries look right; mixed colors
+are in the right area and white comes out tinted.
+
+`"blink"` (default `false`) toggles whichever color is active on/off every 400ms
+instead of holding it solid. See `include/rgb_led.h` for the implementation —
+`LedSpec` there carries explicit 8-bit channels, which is what made hex a small
+change: `write()` already drove three LEDC channels at 8-bit duty, so the old
+four-value enum was the only thing in the way.
+
+`"jingle"` is also optional and picks a short notification tune to play on
+the piezo (`PIEZO_PIN`) right as the message starts showing, before its text
+begins typing — `"chime"`, `"alert"`, `"fanfare"`, or `"gentle"`; omit it (or
+leave it `""`, the default) to play nothing. Each tune runs synchronously and
+finishes in well under a second, so it never overlaps `beepChar()`'s own
+per-character tone() calls on the same pin. An unrecognized `"jingle"` string
+logs a warning and plays nothing, same fallback as `"led"`/`"expression"`.
+See `include/jingle.h` for the note tables.
+
+Config lives in `include/secrets.h` (gitignored — copy `secrets.h.example`
+and fill in `WIFI_SSID`/`WIFI_PASS`/`MQTT_HOST`/`MQTT_PORT`/`MQTT_TOPIC`).
+Expression strings match `kExpressionNames[]` in `main.cpp` case-insensitively
+(see contract v2 above) — an unrecognized string falls back to `Neutral` and
+logs a warning rather than failing silently.
+
+A few sharp edges worth knowing if this stops working:
+- **PubSubClient's default 256-byte buffer silently drops anything larger** —
+  no error, nothing in the callback, the message just never arrives.
+  `mqtt_link.h` calls `setBufferSize(512)` explicitly; if messages start
+  disappearing, check payload size against that first.
+- **Keepalive is bumped to 60s** (`setKeepAlive(60)`, default is 15s) because
+  `bubble->show()` blocks per-character for `strlen * charDelayMs` — a long
+  message can eat several seconds inside the callback, during which
+  `client.loop()` isn't being re-entered.
+- **`appTask`'s stack is 8192 bytes**, not the demo's old 4096 — WiFi,
+  PubSubClient and ArduinoJson buffers all share it now, and the old size
+  overflows silently once networking is in the mix.
+- **Reconnect checks WiFi before retrying MQTT**, not two independent retry
+  loops — the common hobby-AP failure mode is WiFi dropping mid-MQTT-retry
+  and hammering `client.connect()` against a dead link.
+- The board publishes `avatar/status` (`"online"`/`"offline"` via MQTT LWT,
+  retained) so anything watching can tell if it's actually up.
+- **`MqttLink::showStartupInfo()`'s bubble message** reports MQTT
+  host/port/status, the device name (`deviceName_`, doubling as the WiFi
+  hostname — set via `WiFi.setHostname()` in `connectWiFi()`, ahead of
+  `WiFi.begin()`, since ESP32 only honors it if set before the connection is
+  made) + IP, and the BLE device name/address.
+  **Correction, 2026-09-16:** this used to show automatically, once, right
+  after `appTask` connects — added 2026-09-15 so that was readable off the
+  panel without a laptop. Changed so it no longer appears on boot at all: a
+  freshly-flashed device sitting on a desk has no reason to broadcast its
+  diagnostics before anyone's asked for them. It now only shows on demand —
+  a click on the button while the bubble is idle **and no MQTT/BLE message
+  has ever arrived yet** (see `MqttLink::onButtonClick()`'s
+  `configInfoRequested_` branch, deferred to `loop()` the same way a replay
+  is). Once any message has been shown, that latches for good and the same
+  idle click instead replays the last message — this diagnostic screen is
+  unreachable again until the next reboot. `main.cpp`'s `appTask` still
+  starts `bleConfig.begin()` ahead of this, but now only so
+  `mqttLink.setBleIdentity()` can capture the BLE address
+  (`NimBLEDevice::getAddress()`) for whenever the button click does arrive.
+- **The "ISS is passing overhead" message some sessions saw isn't from this
+  repo at all** — it's `~/Homelab/osmo/avatar-brain`'s `producers/iss.py`, a
+  separate MQTT publisher that polls a live-position API and posts to
+  `avatar/say` when the ISS is within 500km, in a project this board just
+  happens to subscribe to. Disabled 2026-09-15 in that repo's `main.py`
+  (`IssPasses()` dropped from `PRODUCERS`) at Kevin's request — the producer
+  file itself is left in place there in case it's wanted back.
+- **Corrected 2026-09-17:** this used to say flash was at **88% of the 1.25MB
+  app partition**, with "not a lot of headroom left for more libraries". That
+  was measured before `partitions_huge_app.csv` took effect (see the comment in
+  `platformio.ini`), which trades the second OTA slot for a 3MB app partition.
+  Measured today on the contract v2 build: **1,439,611 bytes, 45.8% of
+  3,145,728**. The old number was believable because it was true of the old
+  partition table — but the conclusion drawn from it, that there was no room to
+  grow, is no longer the case.
+- **The device has an affectionate "device name"** (`DeviceSettings::name`,
+  default `mqttchan`, editable from the control page's Settings panel — see
+  `docs/index.html`), not just a secrets.h-configured hostname. It's used as
+  the WiFi hostname, the BLE beacon name/GAP name, and the self-reference
+  text in `showStartupInfo()` above. WiFi hostname changes take effect on the
+  next reconnect, same as any other BLE-written setting (`reconfigure()`
+  forces one). The BLE name is different: `BleConfigService::renameDevice()`
+  re-advertises under the new name live, without a reboot — `NimBLEDevice::
+  setDeviceName()` plus `NimBLEAdvertising::setName()` + a stop/start cycle,
+  called from `onConfig_`'s own NimBLE host-task thread since (unlike
+  WiFi/MQTT) none of that touches lwIP.
+- **The bubble panel no longer goes blank while booting.** `appTask` types
+  "Connecting to `<ssid>`" on the bubble right before the blocking
+  WiFi connect, then "Fetching data" once that attempt has settled and
+  MQTT/SNTP take over. `DigitalClock::draw()`'s unsynced branch (in
+  `digital_clock.h`) picks up that same "Fetching data" text once
+  `idleClock` starts ticking, so the panel stays on message instead of
+  blanking for however long SNTP/MQTT actually take. **Correction,
+  2026-09-16:** an earlier version of this file said the
+  unsynced clock panel should stay blank because the startup jingle already
+  covers the wait — that only holds for the jingle's few seconds, not for a
+  slow broker or NTP server, so the blank fallback is gone.
+
+**Headless bench test, no broker needed:** build with `-DAVATAR_FB_DUMP` and
+`appTask` injects one synthetic payload straight into the parse-and-display
+path (`MqttLink::injectForTest()`) before entering its normal loop, then
+dumps both panels' framebuffers to serial — exercises the whole JSON →
+expression → display pipeline without a live MQTT broker. See "Seeing what
+the panel shows" below for the flag mechanics.
+
+**Corrected 2026-09-17 — this section used to describe a limitation that no
+longer exists.** It said `SpeechBubble::wrapLines()` doesn't cap vertical line
+count, so "text too long for the 64px panel just wraps past the bottom edge and
+isn't visible", and concluded that publishers should keep messages well under
+~50 characters. That was true when written, and stayed believable because the
+50-character advice is good for *readability* either way.
+
+What actually happens now: `show()` sets a scroll rect over the content area and
+calls `scroll(0, -lineHeight)` once lines exceed `maxLines`, so long text scrolls
+up a row at a time as it types rather than disappearing off the bottom. Nothing
+is lost to the panel edge.
+
+The real costs of long text are different, and both are timing:
+- It reveals at ~45ms/char, so a 200-character message takes ~9s to type, during
+  which `mqtt_.loop()` is not being serviced.
+- Lines that have scrolled off cannot be re-read — the message has to be read as
+  it types.
+
+The only hard limit is the **512-byte payload cap** below, which is about the
+whole JSON payload rather than the text. Pacing long messages is `services/api`'s
+job (see its queue, which derives the gap between publishes from text length),
+not something this file needs to police.
+
+## Where to hook the "TBD" half
+
+`speakFor()` (demo mode only) drives `mouthOpenRatio` from random noise as a
+placeholder lip-sync. A real TTS or mic-amplitude source would need its own
+hook in MQTT mode, since the MQTT callback currently only calls
+`setExpression()`/`bubble->show()` — nothing drives the mouth outside demo
+mode yet. No speaker is wired to this board either way, and
+`cfg.internal_spk` is off in `setup()` — turn it on when an I2S DAC is added.
+The library also ships `tasks/LipSync.h` for mic-driven mouth movement, which
+is unused here.

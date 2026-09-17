@@ -11,9 +11,26 @@
 #include <freertos/task.h>
 
 // Mirrors the "led" string a message payload can carry (see
-// MqttLink::parseMessage()'s ledColorFromString()). None means the message
+// MqttLink::parseMessage()'s ledSpecFromString()). Mode::Off means the message
 // didn't ask for a color, so the LED stays off for it.
-enum class LedColor { None, Red, Green, Blue, Cycle };
+//
+// Carries explicit 8-bit channels rather than a fixed set of named colors.
+// write() below already drives three LEDC channels at 8-bit duty, so an
+// arbitrary RGB triple costs exactly what a named primary used to - the old
+// four-value enum was the only thing standing between a payload and any color.
+// That is what lets "led" carry "#RRGGBB" (and the control page offer a color
+// picker) instead of choosing from four strings.
+//
+// Caveat worth knowing before trusting a color: the per-channel resistors are
+// deliberately unmatched (~150-220ohm red, ~220-330ohm green/blue, because the
+// dies have different forward voltages - see the README's "RGB status LED"
+// section). Full-scale primaries look right; arbitrary mixed colors are
+// approximate and white comes out tinted. This gives you control, not
+// calibration.
+struct LedSpec {
+  enum class Mode { Off, Solid, Cycle } mode = Mode::Off;
+  uint8_t r = 0, g = 0, b = 0;  // used when mode == Solid
+};
 
 class RgbLed {
  public:
@@ -32,22 +49,20 @@ class RgbLed {
   // over time while the caller is off blocking on SpeechBubble::show()/
   // holdWithCountdown(), so those run on their own task instead — same
   // fire-and-forget pattern as MqttLink's lipSyncTask animating the mouth
-  // across the same blocking calls. color == None is just stop().
-  void start(LedColor color, bool blink) {
-    if (color == LedColor::None) {
+  // across the same blocking calls. Mode::Off is just stop().
+  void start(const LedSpec &spec, bool blink) {
+    if (spec.mode == LedSpec::Mode::Off) {
       stop();
       return;
     }
-    color_ = color;
+    spec_ = spec;
     blink_ = blink;
     active_ = true;
-    if (color == LedColor::Cycle || blink) {
+    if (spec.mode == LedSpec::Mode::Cycle || blink) {
       xTaskCreatePinnedToCore(animateTaskFn, "ledAnimate", 2048, this, 1,
                                nullptr, PRO_CPU_NUM);
     } else {
-      uint8_t r, g, b;
-      solidToRgb(color, r, g, b);
-      write(r, g, b);
+      write(spec.r, spec.g, spec.b);
     }
   }
 
@@ -67,16 +82,6 @@ class RgbLed {
   static constexpr uint32_t kAnimateStepMs = 20;
   static constexpr float kCycleDegPerStep = 2.0f;    // ~3.6s per full sweep
   static constexpr uint32_t kBlinkIntervalMs = 400;  // on/off half-period
-
-  static void solidToRgb(LedColor color, uint8_t &r, uint8_t &g, uint8_t &b) {
-    r = g = b = 0;
-    switch (color) {
-      case LedColor::Red: r = 255; break;
-      case LedColor::Green: g = 255; break;
-      case LedColor::Blue: b = 255; break;
-      default: break;  // Cycle is handled by the animate task, not here
-    }
-  }
 
   // Standard HSV(h in [0,360), s=v=1) -> RGB, same formula as the
   // RGB_LED_TEST spectrum sweep in main.cpp (kept as a separate copy here
@@ -113,12 +118,14 @@ class RgbLed {
     uint32_t lastToggle = millis();
     while (active_) {
       uint8_t r, g, b;
-      if (color_ == LedColor::Cycle) {
+      if (spec_.mode == LedSpec::Mode::Cycle) {
         hsvToRgb(hue, r, g, b);
         hue += kCycleDegPerStep;
         if (hue >= 360.0f) hue -= 360.0f;
       } else {
-        solidToRgb(color_, r, g, b);
+        r = spec_.r;
+        g = spec_.g;
+        b = spec_.b;
       }
       if (blink_) {
         uint32_t now = millis();
@@ -154,6 +161,6 @@ class RgbLed {
   // lipSyncActive_ in mqtt_link.h - worst case is a cosmetic race across
   // back-to-back messages, never a crash (each is a single-word write/read).
   volatile bool active_ = false;
-  LedColor color_ = LedColor::None;
+  LedSpec spec_;
   bool blink_ = false;
 };

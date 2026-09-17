@@ -1,6 +1,6 @@
 // Plays a short notification tune on the piezo (see main.cpp's PIEZO_PIN)
 // when a message arrives, the same "optional peripheral, picked per-message"
-// treatment as rgb_led.h's LedColor - MqttLink calls play() once as a message
+// treatment as rgb_led.h's LedSpec - MqttLink calls play() once as a message
 // starts showing (see mqtt_link.h's display()).
 #pragma once
 

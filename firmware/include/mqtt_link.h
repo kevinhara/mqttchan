@@ -14,6 +14,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <string.h>
+#include <strings.h>  // strcasecmp
+#include <ctype.h>
 #include <time.h>
 #include <deque>
 #include <utility>
@@ -347,7 +349,7 @@ class MqttLink {
   struct PendingMessage {
     String text;
     String exprName;
-    LedColor ledColor = LedColor::None;
+    LedSpec ledSpec;
     bool ledBlink = false;
     JingleTune jingle = JingleTune::None;
   };
@@ -356,20 +358,60 @@ class MqttLink {
     if (self_ != nullptr) self_->enqueue(payload, length);
   }
 
-  // "led" is optional and, when present, must be one of these four strings
-  // (case-sensitive, same convention as "expression"'s kExpressionNames
-  // match) - anything else logs a warning and leaves the LED off for this
-  // message, same "unrecognized falls back rather than fails" treatment as
-  // an unrecognized expression.
-  static LedColor ledColorFromString(const String &name) {
-    if (name.length() == 0) return LedColor::None;
-    if (name == "red") return LedColor::Red;
-    if (name == "green") return LedColor::Green;
-    if (name == "blue") return LedColor::Blue;
-    if (name == "cycle") return LedColor::Cycle;
+  static LedSpec solidLed(uint8_t r, uint8_t g, uint8_t b) {
+    LedSpec spec;
+    spec.mode = LedSpec::Mode::Solid;
+    spec.r = r;
+    spec.g = g;
+    spec.b = b;
+    return spec;
+  }
+
+  static bool allHexDigits(const char *s) {
+    for (; *s != '\0'; s++) {
+      if (!isxdigit(static_cast<unsigned char>(*s))) return false;
+    }
+    return true;
+  }
+
+  // "led" is optional. Accepted forms, in the order tried:
+  //   ""        - absent or empty, the LED stays off for this message
+  //   "cycle"   - the HSV rainbow sweep (a mode, not a color)
+  //   "#RRGGBB" - any color, with or without the leading '#'
+  //   "red"/"green"/"blue" - aliases for the full-scale primaries, kept so the
+  //               control page and older publishers keep working unchanged
+  // Anything else logs a warning and leaves the LED off for this message - the
+  // same "unrecognized falls back rather than fails" treatment as an
+  // unrecognized expression. Matching is case-insensitive, same as the
+  // expression match in display().
+  //
+  // Only the exact 6-digit hex form is accepted: a short "#fff" or a stray
+  // trailing character is a typo worth warning about rather than something to
+  // guess the intent of.
+  static LedSpec ledSpecFromString(const String &raw) {
+    LedSpec spec;  // defaults to Mode::Off
+    String name = raw;
+    name.trim();
+    if (name.length() == 0) return spec;
+
+    if (strcasecmp(name.c_str(), "cycle") == 0) {
+      spec.mode = LedSpec::Mode::Cycle;
+      return spec;
+    }
+    if (strcasecmp(name.c_str(), "red") == 0) return solidLed(255, 0, 0);
+    if (strcasecmp(name.c_str(), "green") == 0) return solidLed(0, 255, 0);
+    if (strcasecmp(name.c_str(), "blue") == 0) return solidLed(0, 0, 255);
+
+    const char *hex = name.c_str();
+    if (*hex == '#') hex++;
+    if (strlen(hex) == 6 && allHexDigits(hex)) {
+      uint32_t v = strtoul(hex, nullptr, 16);
+      return solidLed((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+    }
+
     Serial.printf("MQTT: unrecognized led color '%s', leaving LED off\n",
-                  name.c_str());
-    return LedColor::None;
+                  raw.c_str());
+    return spec;
   }
 
   // "jingle" is optional and, when present, must be one of these four
@@ -398,7 +440,7 @@ class MqttLink {
     }
     out->text = doc["text"] | "";
     out->exprName = doc["expression"] | "";
-    out->ledColor = ledColorFromString(doc["led"] | "");
+    out->ledSpec = ledSpecFromString(doc["led"] | "");
     out->ledBlink = doc["blink"] | false;
     out->jingle = jingleFromString(doc["jingle"] | "");
     return true;
@@ -479,7 +521,10 @@ class MqttLink {
     m5avatar::Expression expr = m5avatar::Expression::Neutral;
     bool matched = false;
     for (size_t i = 0; i < count_; i++) {
-      if (strcmp(names_[i], msg.exprName.c_str()) == 0) {
+      // Case-insensitive: lowercase ("happy") is the canonical spelling the
+      // API and docs use, but kExpressionNames[] is capitalized and older
+      // publishers send it that way, so both must match.
+      if (strcasecmp(names_[i], msg.exprName.c_str()) == 0) {
         expr = exprs_[i];
         matched = true;
         break;
@@ -510,7 +555,7 @@ class MqttLink {
       // Lit before typing starts and left running through the hold below -
       // "on screen" covers the whole reveal-plus-hold, not just the hold
       // - see rgb_led.h's start()/stop().
-      if (led_ != nullptr) led_->start(msg.ledColor, msg.ledBlink);
+      if (led_ != nullptr) led_->start(msg.ledSpec, msg.ledBlink);
       // Played before typing starts, not alongside it - Jingle::play() blocks
       // this thread for the tune's duration, so it finishes before
       // bubble_->show() below starts firing its own per-character tone()

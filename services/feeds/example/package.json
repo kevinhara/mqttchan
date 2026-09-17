@@ -1,0 +1,11 @@
+{
+  "name": "@mqttchan/feed-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "dependencies": {
+    "@mqttchan/contract": "*",
+    "@mqttchan/feed-kit": "*"
+  }
+}

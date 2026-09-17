@@ -1,0 +1,12 @@
+{
+  "name": "@mqttchan/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "dependencies": {
+    "@mqttchan/contract": "*",
+    "fastify": "^5.1.0",
+    "mqtt": "^5.10.0"
+  }
+}
