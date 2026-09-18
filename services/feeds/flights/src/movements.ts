@@ -8,6 +8,7 @@
  */
 
 import type { Aircraft } from "./adsb.js";
+import type { Route } from "./routes.js";
 
 export type Presence = "ground" | "airborne";
 export type Movement = "arrived" | "departed";
@@ -170,10 +171,24 @@ export class MovementDetector {
   }
 }
 
-/** e.g. `ANZ611 landed at ZQN`. Kept short on purpose: the device types the
- *  bubble out at ~45ms a character and holds it for 30s afterwards. */
-export function movementText(m: DetectedMovement, airportCode: string): string {
-  return m.movement === "arrived"
-    ? `${m.ident} landed at ${airportCode}`
+/**
+ * e.g. `ANZ611 landed at ZQN` or, with a route on file,
+ * `ANZ611 landed at ZQN from AUCKLAND`. Kept short on purpose: the device
+ * types the bubble out at ~45ms a character and holds it for 30s afterwards -
+ * `route` is omitted (`undefined` or `null`) whenever adsbdb has nothing for
+ * this callsign, and the message just says less.
+ */
+export function movementText(
+  m: DetectedMovement,
+  airportCode: string,
+  route?: Route | null,
+): string {
+  if (m.movement === "arrived") {
+    return route
+      ? `${m.ident} landed at ${airportCode} from ${route.origin}`
+      : `${m.ident} landed at ${airportCode}`;
+  }
+  return route
+    ? `${m.ident} left ${airportCode} for ${route.destination}`
     : `${m.ident} left ${airportCode}`;
 }

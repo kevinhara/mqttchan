@@ -5,6 +5,7 @@
     { "path": "./packages/feed-kit" },
     { "path": "./api" },
     { "path": "./feeds/example" },
-    { "path": "./feeds/flights" }
+    { "path": "./feeds/flights" },
+    { "path": "./feeds/ha-temperature" }
   ]
 }

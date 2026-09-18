@@ -34,12 +34,17 @@ const BY_KIND: Record<string, Presentation> = {
   ambient: QUIET,
   /** A sensor value changed. Same treatment: seen, not announced. */
   "sensor.reading": QUIET,
-  /** Something worth looking up for. */
+  /**
+   * Something worth looking up for. `boarding` (added 2026-09-18) is the
+   * default here rather than `chime` because the flights feed is currently
+   * the only source of `notice` messages - a discreet PA-style chime for an
+   * aircraft movement, not yet re-tuned for any other `notice` producer.
+   */
   notice: {
     expression: "happy",
     led: "#3399ff",
     blink: false,
-    jingle: "chime",
+    jingle: "boarding",
   },
   /** Something wrong. The only kind that blinks. */
   alert: {

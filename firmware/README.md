@@ -540,12 +540,31 @@ four-value enum was the only thing in the way.
 
 `"jingle"` is also optional and picks a short notification tune to play on
 the piezo (`PIEZO_PIN`) right as the message starts showing, before its text
-begins typing — `"chime"`, `"alert"`, `"fanfare"`, or `"gentle"`; omit it (or
-leave it `""`, the default) to play nothing. Each tune runs synchronously and
-finishes in well under a second, so it never overlaps `beepChar()`'s own
-per-character tone() calls on the same pin. An unrecognized `"jingle"` string
-logs a warning and plays nothing, same fallback as `"led"`/`"expression"`.
-See `include/jingle.h` for the note tables.
+begins typing — `"chime"`, `"alert"`, `"fanfare"`, `"gentle"`, or `"boarding"`;
+omit it (or leave it `""`, the default) to play nothing. Each tune runs
+synchronously and finishes in well under a second, so it never overlaps
+`beepChar()`'s own per-character tone() calls on the same pin. An unrecognized
+`"jingle"` string logs a warning and plays nothing, same fallback as
+`"led"`/`"expression"`. See `include/jingle.h` for the note tables.
+
+**`"boarding"` (added 2026-09-18)** is a discreet two-tone "bing-bong" played
+twice — the shape of a real airport PA chime, short and unhurried rather than
+urgent. It is the API's default jingle for `kind: "notice"` (see
+`services/api/src/triage.ts`), which today only the flights feed sends, so in
+practice it plays for every aircraft arrival and departure.
+
+**Verified live 2026-09-18** on the same board (`/dev/cu.usbserial-0001`,
+`Ziggy`, `10.0.0.114`), same method as the 2026-09-17 table: publish to
+`avatar/say`, read the serial log, negative control included.
+
+| Published | Serial output |
+|---|---|
+| `{"jingle":"boarding",...}` | silent — parsed, tune plays |
+| `{"jingle":"kazoo",...}` | warned and fell back, same as before |
+
+This confirms parsing and that a tune plays, not what it sounds like through
+the piezo — nobody listened to the board for this check, so "discreet
+PA chime" above is a description of the note table, not an ear-verified claim.
 
 Config lives in `include/secrets.h` (gitignored — copy `secrets.h.example`
 and fill in `WIFI_SSID`/`WIFI_PASS`/`MQTT_HOST`/`MQTT_PORT`/`MQTT_TOPIC`).

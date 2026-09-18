@@ -63,6 +63,40 @@ predecessor service's README named "airplanes.live or adsb.lol keyed to
 lat/lon + radius, not local SDR hardware". airplanes.live serves the same
 `/v2/point` shape and is the fallback if this goes away.
 
+## Naming the route (adsbdb.com)
+
+adsb.lol only ever gives a position, never where a flight came from or is
+going — so once a movement is detected, `src/routes.ts` makes a second,
+unrelated lookup to `api.adsb.lol`'s namesake-but-separate `adsbdb.com`,
+keyed on the callsign alone, and the message becomes e.g.
+`QFA122 left ZQN for SYDNEY` instead of `QFA122 left ZQN`.
+
+This is decoration, never a gate: `fetchRoute` swallows every failure —
+unfiled callsign, network error, timeout — and returns `null`, and
+`movementText` falls back to the plain form. A movement is never held back or
+dropped for want of a route.
+
+Verified live 2026-09-18:
+
+- `GET /v0/callsign/ANZ611` → Auckland → Queenstown; `GET
+  /v0/callsign/QFA122` → Queenstown → Sydney. The route sits at
+  `response.flightroute.{origin,destination}.municipality` — nested one level
+  deeper than it looks at a glance, and the first version of this lookup
+  missed the `flightroute` wrapper and silently returned `null` for every
+  callsign until a live check against ANZ611 caught it.
+- A registration (`ZK-OYB`) comes back `400 invalid callsign`, an unfiled or
+  made-up callsign (`NOTREAL1`) comes back `404 unknown callsign` — both as
+  `{"response": "<message>"}`, not a thrown error, so `fetchRoute` reads that
+  shape as "no route" rather than a failure.
+- **The same IPv6 blackhole as api.adsb.lol hits this host too**: node's
+  `fetch()` hangs to `ETIMEDOUT` against `api.adsbdb.com`, `https.get` with
+  `family: 4` returns 200 immediately. `routes.ts` forces IPv4 the same way
+  `adsb.ts` does, for the same reason.
+- The hex and registration fallbacks `identify()` produces when no callsign
+  was transmitted are skipped before the request is even made — adsbdb has no
+  route for either, and a bare hex (e.g. `C829AC`) otherwise looks enough like
+  a valid callsign shape to be worth guarding against explicitly.
+
 ## Verified
 
 2026-09-18, against the live API and a real movement:

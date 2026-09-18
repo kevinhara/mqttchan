@@ -9,6 +9,7 @@ packages/feed-kit   the client, poll loop and change tracking every feed needs
 api                 triage, rate limiting, and the MQTT connection
 feeds/example       a template feed, not a real integration
 feeds/flights       arrivals and departures at ZQN, from live ADS-B
+feeds/ha-temperature  room temperatures from Home Assistant, Zigbee sensors only
 ```
 
 ## The idea
@@ -103,13 +104,13 @@ ADS-B. Built and verified against a real landing on 2026-09-18; see
 detected, the four rules that stop false positives, and two undocumented
 adsb.lol behaviours that will otherwise cost you an hour.
 
-## Still to do: the Home Assistant temperature feed
+## The Home Assistant temperature feed
 
-**Changed 2026-09-18:** this section used to read "Next: the Home Assistant
-temperature feed", and the top-level README called it the first real feed.
-`feeds/flights` was built first instead — it was simply what got asked for. The
-research below was done on 2026-09-17 and still stands; nothing about it was
-wrong, it just is not next any more.
+**Changed 2026-09-18 (later the same day):** this section used to be "Still to
+do", holding only research. `feeds/ha-temperature` is now built — see
+[`feeds/ha-temperature/README.md`](feeds/ha-temperature/README.md). The
+research below from 2026-09-17 still stands and fed directly into it; nothing
+in it was wrong.
 
 Verified against live HA on 2026-09-17, so it doesn't need rediscovering:
 
@@ -129,3 +130,12 @@ Verified against live HA on 2026-09-17, so it doesn't need rediscovering:
 The long-lived token goes in `.env` on osmo. The one still sitting in the old
 `avatar-brain/.env` returns 401, which is why that service never published
 anything.
+
+**Resolved 2026-09-18:** this research didn't establish which HA integration
+those Zigbee sensors run on (ZHA, Zigbee2MQTT, deCONZ). `HA_ZIGBEE_INTEGRATION`
+defaults to `zha`, and running the feed against live HA on osmo confirmed that
+guess was right first try - 7 sensors, matching seven of the eight room names
+above (`sensor.home_temperature` turned out not to be a `zha` entity - see
+`feeds/ha-temperature/README.md`'s Verified section for why). Both BTHome
+sensors and the CPU monitor were correctly excluded despite sharing
+`device_class: temperature`.

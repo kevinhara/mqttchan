@@ -21,6 +21,7 @@ import {
   presenceOf,
   type Airport,
 } from "./movements.js";
+import { fetchRoute } from "./routes.js";
 
 const SOURCE = "flights";
 
@@ -110,11 +111,20 @@ async function tick(): Promise<void> {
   }
 
   for (const movement of movements) {
+    // Only a real callsign has a route on file - the hex fallback identify()
+    // uses when no callsign was transmitted never does.
+    const route =
+      movement.ident.toLowerCase() === movement.hex.toLowerCase()
+        ? null
+        : await fetchRoute(movement.ident);
+    const text = movementText(movement, airport.code, route);
+
     const result = await client.send({
       kind: "notice",
-      text: movementText(movement, airport.code),
-      // Worth interrupting for, but not an alert - `normal` keeps the chime
-      // that `kind: "notice"` carries, which `low` would strip.
+      text,
+      // Worth interrupting for, but not an alert - `normal` keeps the
+      // boarding-style chime that `kind: "notice"` carries, which `low`
+      // would strip.
       priority: "normal",
       // Per aircraft and per movement, so two different flights never collapse
       // into one another - only a repeat of this aircraft's own arrival or
@@ -127,7 +137,7 @@ async function tick(): Promise<void> {
 
     if (result !== null) {
       console.log(
-        `${SOURCE}: ${movementText(movement, airport.code)} -> ${result.decision}${result.reason ? ` (${result.reason})` : ""}`,
+        `${SOURCE}: ${text} -> ${result.decision}${result.reason ? ` (${result.reason})` : ""}`,
       );
     }
   }

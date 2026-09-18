@@ -235,4 +235,28 @@ describe("movementText", () => {
     // ~45ms a character on the device, so length is a real cost.
     expect(arrived.length).toBeLessThan(32);
   });
+
+  it("names where the flight came from or is going, when a route is on file", () => {
+    const route = { origin: "AUCKLAND", destination: "SYDNEY" };
+    expect(
+      movementText(
+        { hex: "c829ac", ident: "ANZ611", movement: "arrived" },
+        "ZQN",
+        route,
+      ),
+    ).toBe("ANZ611 landed at ZQN from AUCKLAND");
+    expect(
+      movementText(
+        { hex: "c82b42", ident: "QF122", movement: "departed" },
+        "ZQN",
+        route,
+      ),
+    ).toBe("QF122 left ZQN for SYDNEY");
+  });
+
+  it("falls back to the plain form when there is no route", () => {
+    const m = { hex: "c829ac", ident: "ANZ611", movement: "arrived" } as const;
+    expect(movementText(m, "ZQN", null)).toBe("ANZ611 landed at ZQN");
+    expect(movementText(m, "ZQN", undefined)).toBe("ANZ611 landed at ZQN");
+  });
 });

@@ -437,6 +437,7 @@ class MqttLink {
     if (strcasecmp(name.c_str(), "alert") == 0) return JingleTune::Alert;
     if (strcasecmp(name.c_str(), "fanfare") == 0) return JingleTune::Fanfare;
     if (strcasecmp(name.c_str(), "gentle") == 0) return JingleTune::Gentle;
+    if (strcasecmp(name.c_str(), "boarding") == 0) return JingleTune::Boarding;
     Serial.printf("MQTT: unrecognized jingle '%s', playing nothing\n",
                   name.c_str());
     return JingleTune::None;

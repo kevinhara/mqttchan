@@ -11,7 +11,7 @@
 // Mirrors the "jingle" string a message payload can carry (see
 // MqttLink::parseMessage()'s jingleFromString()). None means the message
 // didn't ask for a jingle, so nothing plays.
-enum class JingleTune { None, Chime, Alert, Fanfare, Gentle };
+enum class JingleTune { None, Chime, Alert, Fanfare, Gentle, Boarding };
 
 class Jingle {
  public:
@@ -94,11 +94,23 @@ class Jingle {
         {554, 260, 80},   // C#5
         {659, 380, 0},    // E5 - soft, unhurried three-note rise
     };
+    // Added 2026-09-18 for the flights feed's arrivals/departures - a
+    // discreet two-tone "bing-bong" played twice, the same shape as a real
+    // airport PA chime, so a movement announcement reads as "attention"
+    // rather than "urgent" the way Alert's sharp beeps would. Not yet
+    // verified live on the board - see firmware/README.md's jingle table.
+    static const Note kBoarding[] = {
+        {784, 160, 50},   // G5 - "bing"
+        {523, 160, 220},  // C5 - "bong"
+        {784, 160, 50},   // G5 - "bing"
+        {523, 320, 0},    // C5 - "bong", held for the landing
+    };
     switch (tune) {
       case JingleTune::Chime: notes = kChime; count = sizeof(kChime) / sizeof(kChime[0]); return;
       case JingleTune::Alert: notes = kAlert; count = sizeof(kAlert) / sizeof(kAlert[0]); return;
       case JingleTune::Fanfare: notes = kFanfare; count = sizeof(kFanfare) / sizeof(kFanfare[0]); return;
       case JingleTune::Gentle: notes = kGentle; count = sizeof(kGentle) / sizeof(kGentle[0]); return;
+      case JingleTune::Boarding: notes = kBoarding; count = sizeof(kBoarding) / sizeof(kBoarding[0]); return;
       default: notes = nullptr; count = 0; return;
     }
   }

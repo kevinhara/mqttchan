@@ -42,3 +42,17 @@ services:
       AIRPORT_LON: "168.7392"
       POLL_INTERVAL_MS: "60000"
     command: ["node", "feeds/flights/dist/index.js"]
+
+  # Room temperatures from Home Assistant, Zigbee sensors only. HA_URL and
+  # HA_TOKEN live in .env. HA_ZIGBEE_INTEGRATION=zha confirmed live on osmo,
+  # 2026-09-18 - see feeds/ha-temperature/README.md.
+  feed-ha-temperature:
+    image: mqttchan-services
+    container_name: mqttchan-feed-ha-temperature
+    restart: unless-stopped
+    depends_on: [api]
+    env_file: .env
+    environment:
+      API_URL: http://api:8420
+      POLL_INTERVAL_MS: "60000"
+    command: ["node", "feeds/ha-temperature/dist/index.js"]
