@@ -63,15 +63,16 @@ class SpeechBubble {
     // not the border. maxLines is rounded down, so lineHeight always
     // divides the scroll region evenly and a scroll never leaves a sliver
     // of the previous line's pixels behind.
-    const int maxLines = (display_->height() - 2 * kMargin) / lineHeight;
+    const int maxLines =
+        (display_->height() - kTopMargin - kMargin) / lineHeight;
     const int scrollHeight = maxLines * lineHeight;
     // setScrollRect only affects scroll() below, not normal drawing/clipping,
     // so this can be set once up front without touching fillScreen/
     // drawRoundRect above or the per-character prints below.
-    display_->setScrollRect(kMargin, kMargin,
+    display_->setScrollRect(kMargin, kTopMargin,
                              display_->width() - 2 * kMargin, scrollHeight);
 
-    int cursorY = kMargin;
+    int cursorY = kTopMargin;
     std::vector<String> lines = wrapLines(text);
     for (size_t lineIndex = 0; lineIndex < lines.size(); lineIndex++) {
       if (lineIndex > 0) {
@@ -89,6 +90,16 @@ class SpeechBubble {
         }
       }
       const String &line = lines[lineIndex];
+      // Explicit wipe of this row's own rect before drawing into it, rather
+      // than trusting the one whole-screen fillScreen() above plus scroll()'s
+      // own vacated-strip fill to have left it spotless. Belt-and-suspenders
+      // for the "second line garbled at Large text size" report (2026-09-19,
+      // not reproduced in a RAM-shadow-buffer dump taken after a real
+      // multi-scroll run on the board - see git history for that dump - so
+      // this closes the most plausible gap rather than a confirmed root
+      // cause): cheap at this size, and it can only help.
+      display_->fillRect(kMargin, cursorY, display_->width() - 2 * kMargin,
+                          lineHeight, TFT_BLACK);
       display_->setCursor(kMargin, cursorY);
       for (size_t i = 0; i < line.length(); i++) {
         display_->print(line[i]);
@@ -172,6 +183,11 @@ class SpeechBubble {
 
  private:
   static constexpr int kMargin = 7;  // +2px over the old 5px inset from the border
+  // Text's top row sits kMargin below the border already, but the glyph cell
+  // itself (esp. doubled at textSize_ == 2) reaches close enough to the top
+  // stroke to visually touch it - a few extra px of clearance on top only,
+  // not eating into the left/right wrap width or the bottom margin.
+  static constexpr int kTopMargin = kMargin + 4;
   // Row pitch at textSize_ == 1; show() scales this by textSize_ for "Large".
   static constexpr int kBaseLineHeight = 10;
   static constexpr int kBarHeight = 2;

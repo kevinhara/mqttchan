@@ -371,6 +371,12 @@ const JINGLES = [
   { value: "alert", label: "Alert" },
   { value: "fanfare", label: "Fanfare" },
   { value: "gentle", label: "Gentle" },
+  // Missing until 2026-09-19 - "boarding" shipped 2026-09-18 and was never
+  // added here, so the control page couldn't test it. Added alongside
+  // "beep" (new, for `sensor.reading`'s quiet notification tone) instead of
+  // separately, since both were just a missing list entry away from working.
+  { value: "boarding", label: "Boarding" },
+  { value: "beep", label: "Beep" },
 ];
 
 // Must match include/ble_config.h exactly - these are the firmware's GATT

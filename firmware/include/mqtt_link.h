@@ -1,15 +1,13 @@
 // Subscribes to a single MQTT topic carrying {"text":..., "expression":...}
-// JSON and drives the avatar + speech bubble from whatever arrives. Owns
-// WiFi and MQTT connect/reconnect; call begin() once from setup-time code
-// and loop() repeatedly from appTask (core 0) — see main.cpp's core-split
-// comment for why this must not run on core 1.
+// JSON and drives the announcer face + speech bubble from whatever arrives.
+// Owns WiFi and MQTT connect/reconnect; call begin() once from setup-time
+// code and loop() repeatedly from appTask.
 #pragma once
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <Avatar.h>
 #include <M5GFX.h>
 #include <OneButton.h>
 #include <freertos/FreeRTOS.h>
@@ -21,6 +19,7 @@
 #include <deque>
 #include <utility>
 
+#include "portrait_face.h"
 #include "speech_bubble.h"
 #include "digital_clock.h"
 #include "rgb_led.h"
@@ -40,21 +39,29 @@ class MqttLink {
   // calls — see onButtonClick() — so a click can dismiss a message that is
   // still typing or counting down, not just one already finished.
   // faceDisplay/textDisplay, if given, are the two raw M5GFX panels
-  // (avatar/face and bubble/clock respectively) — not otherwise reachable
-  // through avatar_/bubble_, which only expose drawing calls, not panel
-  // power state. Used solely by applyScreenPower() to send the SSD1306
-  // sleep/wake command overnight — see there. nullptr just skips that
-  // entirely, same "optional peripheral" treatment as clock/led/jingle.
-  MqttLink(m5avatar::Avatar *avatar, SpeechBubble *bubble,
-           const char *const *expressionNames,
-           const m5avatar::Expression *expressions, size_t expressionCount,
+  // (announcer/face and bubble/clock respectively) — not otherwise reachable
+  // through portraitFace_/bubble_, which only expose drawing calls, not
+  // panel power state. Used solely by applyScreenPower() to send the
+  // SSD1306 sleep/wake command overnight — see there. nullptr just skips
+  // that entirely, same "optional peripheral" treatment as clock/led/jingle.
+  //
+  // expressionNames/expressionCount is still the six-word "expression"
+  // vocabulary from contract v2 (see README.md/docs/index.html's dropdown) —
+  // kept purely so display() can keep validating/warning on an unrecognized
+  // value the same way it always has. It no longer selects anything on the
+  // face: the portrait pack has no per-mood variants, so a recognized
+  // "expression" is now accepted and silently has no visual effect, the
+  // same as it did nothing before for anyone not on the m5avatar face this
+  // replaced. Night/day still affects the face - see setSleeping() below -
+  // but that's driven by the clock, not by this field.
+  MqttLink(PortraitFace *portraitFace, SpeechBubble *bubble,
+           const char *const *expressionNames, size_t expressionCount,
            DigitalClock *clock = nullptr, RgbLed *led = nullptr,
            OneButton *button = nullptr, Jingle *jingle = nullptr,
            M5GFX *faceDisplay = nullptr, M5GFX *textDisplay = nullptr)
-      : avatar_(avatar),
+      : portraitFace_(portraitFace),
         bubble_(bubble),
         names_(expressionNames),
-        exprs_(expressions),
         count_(expressionCount),
         clock_(clock),
         led_(led),
@@ -320,6 +327,11 @@ class MqttLink {
   // Silence held after a jingle finishes and before typing's own beeps
   // start - see display()'s use of this below.
   static constexpr uint32_t kPostJingleGapMs = 300;
+  // How often lipSyncTask advances the announcer to its next frame while a
+  // message is typing - a steady talking pace rather than the old random
+  // 60-140ms jitter, since real per-character frames (a blink, a mouth
+  // flap) read better on a fixed beat than they did as noise.
+  static constexpr uint32_t kTalkFrameIntervalMs = 150;
 
   void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
@@ -425,12 +437,15 @@ class MqttLink {
     return spec;
   }
 
-  // "jingle" is optional and, when present, must be one of these four
-  // strings, matched case-insensitively for the same reason "led" and
-  // "expression" are (contract v2, 2026-09-17) - being the one field that
-  // still cared about case would be a trap, not a convention. Anything else
-  // logs a warning and plays nothing for this message, same "unrecognized
-  // falls back rather than fails" treatment as the other two.
+  // "jingle" is optional and, when present, must be one of these strings
+  // (six as of "beep", 2026-09-19 - this comment previously said "four" and
+  // was already stale by one at "boarding"; corrected while touching this
+  // line rather than left for the next miscount), matched case-insensitively
+  // for the same reason "led" and "expression" are (contract v2,
+  // 2026-09-17) - being the one field that still cared about case would be a
+  // trap, not a convention. Anything else logs a warning and plays nothing
+  // for this message, same "unrecognized falls back rather than fails"
+  // treatment as the other two.
   static JingleTune jingleFromString(const String &name) {
     if (name.length() == 0) return JingleTune::None;
     if (strcasecmp(name.c_str(), "chime") == 0) return JingleTune::Chime;
@@ -438,6 +453,7 @@ class MqttLink {
     if (strcasecmp(name.c_str(), "fanfare") == 0) return JingleTune::Fanfare;
     if (strcasecmp(name.c_str(), "gentle") == 0) return JingleTune::Gentle;
     if (strcasecmp(name.c_str(), "boarding") == 0) return JingleTune::Boarding;
+    if (strcasecmp(name.c_str(), "beep") == 0) return JingleTune::Beep;
     Serial.printf("MQTT: unrecognized jingle '%s', playing nothing\n",
                   name.c_str());
     return JingleTune::None;
@@ -532,25 +548,24 @@ class MqttLink {
   // drawn as a row of dots in the bubble panel's bottom-left corner so a
   // message flood is visible as "more coming" rather than silently queued.
   void display(const PendingMessage &msg, size_t remainingQueued) {
-    m5avatar::Expression expr = m5avatar::Expression::Neutral;
+    // "expression" no longer drives anything on the face - see the
+    // constructor comment above for why. This loop only still exists to
+    // keep warning on a value nobody recognizes, same as it always has.
     bool matched = false;
     for (size_t i = 0; i < count_; i++) {
       // Case-insensitive: lowercase ("happy") is the canonical spelling the
       // API and docs use, but kExpressionNames[] is capitalized and older
       // publishers send it that way, so both must match.
       if (strcasecmp(names_[i], msg.exprName.c_str()) == 0) {
-        expr = exprs_[i];
         matched = true;
         break;
       }
     }
     if (!matched) {
-      Serial.printf(
-          "MQTT: unrecognized expression '%s', defaulting to Neutral\n",
-          msg.exprName.c_str());
+      Serial.printf("MQTT: unrecognized expression '%s', ignored\n",
+                    msg.exprName.c_str());
     }
 
-    avatar_->setExpression(expr);
     // A new message is about to take over the panel, so any previously held
     // message is no longer what's on screen - reset before the keepLastMessage_
     // branch below decides whether this one ends up held too.
@@ -649,9 +664,13 @@ class MqttLink {
     messageActive_ = false;
     messageHeld_ = false;
     dismissRequested_ = false;
+    // An announcement just finished (typed out and held, or dismissed
+    // mid-typing) - swap in a new random face for next time, per the
+    // "announcer" brief (see portrait_face.h's pickRandom()).
+    if (portraitFace_ != nullptr) portraitFace_->pickRandom();
     // messageActive_ must already be false here - applyRestingExpression()
     // is a no-op while it's true - and restingIsNight_ is forced so the face
-    // actually updates even if the last resting expression (set before this
+    // actually updates even if the last resting state (set before this
     // message arrived) already matched today's night/day state.
     restingIsNight_ = -1;
     applyRestingExpression();
@@ -663,7 +682,7 @@ class MqttLink {
   }
 
   // True between 23:00 and 07:00 local time - the window the resting face
-  // should look asleep rather than its usual Neutral. Unsynced time (see
+  // should look asleep rather than its usual awake sway. Unsynced time (see
   // digital_clock.h's own 1970 check) reads as false: a device that hasn't
   // finished NTP sync yet has no reliable local time to judge night from,
   // and the boot sequence (see main.cpp's jingle/bubble text) already covers
@@ -676,22 +695,21 @@ class MqttLink {
     return local.tm_hour >= 23 || local.tm_hour < 7;
   }
 
-  // Keeps the avatar's resting (no message on screen) expression in sync
-  // with time of day - Sleepy overnight, Neutral otherwise - without
-  // hammering Avatar::setExpression() (which suspends the draw task, see
-  // main.cpp's core-split comment) every ~50ms tick. Only actually calls it
-  // when the night/day state has changed since the last call, tracked via
-  // restingIsNight_ (-1 = not yet applied, e.g. right after boot or a
-  // revertToIdle() reset). No-op while a message is on screen - that's
-  // avatar_'s to control, not this.
+  // Keeps the face's resting (no message on screen) sleep state in sync
+  // with time of day - frozen overnight, breathing otherwise (see
+  // portrait_face.h's setSleeping()) - without calling it every ~50ms tick
+  // for no reason. Only actually calls it when the night/day state has
+  // changed since the last call, tracked via restingIsNight_ (-1 = not yet
+  // applied, e.g. right after boot or a revertToIdle() reset). No-op while
+  // a message is on screen - that's portraitFace_'s startTalking()/
+  // advanceTalkFrame() to control, not this.
   void applyRestingExpression() {
     if (messageActive_) return;
     bool night = isNighttime();
     int8_t state = night ? 1 : 0;
     if (state == restingIsNight_) return;
     restingIsNight_ = state;
-    avatar_->setExpression(night ? m5avatar::Expression::Sleepy
-                                  : m5avatar::Expression::Neutral);
+    if (portraitFace_ != nullptr) portraitFace_->setSleeping(night);
   }
 
   // True from midnight up to (not including) 07:00 local time - the window
@@ -761,21 +779,23 @@ class MqttLink {
     if (textDisplay_ != nullptr) textDisplay_->sleep();
   }
 
-  // Fake lip-sync, same noisy-envelope trick as main.cpp's demo-mode
-  // speakFor(): drives mouthOpenRatio while bubble_->show() reveals the
-  // text on the caller's thread, so the mouth flaps for as long as the
-  // avatar is "talking". Runs as its own task since show() blocks the
-  // thread that would otherwise drive this loop; setMouthOpenRatio() is a
-  // single-word write the draw task only reads, so calling it from here is
-  // safe per the core-split comment in main.cpp. Exits and closes the mouth
-  // once display() clears lipSyncActive_ after show() returns.
+  // Cycles the announcer's portrait through its own frame set while
+  // bubble_->show() reveals the text on the caller's thread - a real
+  // per-character animation now (see portrait_face.h), not the noisy
+  // mouth-ratio placeholder this replaced. Runs as its own task since
+  // show() blocks the thread that would otherwise drive this loop.
+  // advanceTalkFrame()/stopTalking() just flip a couple of ints and issue
+  // one I2C blit, so calling them from here rather than appTask is safe the
+  // same way the old setMouthOpenRatio() call was. Exits once display()
+  // clears lipSyncActive_ after show() returns.
   static void lipSyncTask(void *arg) {
     auto *self = static_cast<MqttLink *>(arg);
+    if (self->portraitFace_ != nullptr) self->portraitFace_->startTalking();
     while (self->lipSyncActive_) {
-      self->avatar_->setMouthOpenRatio(random(0, 100) / 100.0f);
-      vTaskDelay(pdMS_TO_TICKS(random(60, 140)));
+      if (self->portraitFace_ != nullptr) self->portraitFace_->advanceTalkFrame();
+      vTaskDelay(pdMS_TO_TICKS(kTalkFrameIntervalMs));
     }
-    self->avatar_->setMouthOpenRatio(0.0f);
+    if (self->portraitFace_ != nullptr) self->portraitFace_->stopTalking();
     vTaskDelete(nullptr);
   }
 
@@ -796,8 +816,9 @@ class MqttLink {
   // so applyRestingExpression() can tell "never applied" (boot, or just
   // after revertToIdle() forces a re-check) from "already applied, and it
   // was day" - a plain bool defaulting to false would look identical to
-  // "day" and skip the very first avatar_->setExpression() call. Read/written
-  // only from applyRestingExpression()/revertToIdle(), both on appTask.
+  // "day" and skip the very first portraitFace_->setSleeping() call.
+  // Read/written only from applyRestingExpression()/revertToIdle(), both on
+  // appTask.
   int8_t restingIsNight_ = -1;
   // Plain bool, unlike restingIsNight_ above: applyScreenPower() runs
   // unconditionally (see there), so there's no "not yet applied" case to
@@ -840,10 +861,9 @@ class MqttLink {
   // see enqueue()'s comment.
   SemaphoreHandle_t queueMutex_ = xSemaphoreCreateMutex();
 
-  m5avatar::Avatar *avatar_;
+  PortraitFace *portraitFace_;
   SpeechBubble *bubble_;
   const char *const *names_;
-  const m5avatar::Expression *exprs_;
   size_t count_;
   DigitalClock *clock_;
   RgbLed *led_;

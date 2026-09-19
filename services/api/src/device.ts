@@ -21,7 +21,7 @@ export const EXPRESSIONS = [
 ] as const;
 export type Expression = (typeof EXPRESSIONS)[number];
 
-export const JINGLES = ["chime", "alert", "fanfare", "gentle", "boarding"] as const;
+export const JINGLES = ["chime", "alert", "fanfare", "gentle", "boarding", "beep"] as const;
 export type Jingle = (typeof JINGLES)[number];
 
 /** "" = no LED, "cycle" = HSV sweep, otherwise "#rrggbb". */

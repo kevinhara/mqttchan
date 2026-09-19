@@ -11,7 +11,7 @@
 // Mirrors the "jingle" string a message payload can carry (see
 // MqttLink::parseMessage()'s jingleFromString()). None means the message
 // didn't ask for a jingle, so nothing plays.
-enum class JingleTune { None, Chime, Alert, Fanfare, Gentle, Boarding };
+enum class JingleTune { None, Chime, Alert, Fanfare, Gentle, Boarding, Beep };
 
 class Jingle {
  public:
@@ -105,12 +105,21 @@ class Jingle {
         {784, 160, 50},   // G5 - "bing"
         {523, 320, 0},    // C5 - "bong", held for the landing
     };
+    // Added 2026-09-19 for `sensor.reading` (see the API's triage.ts) - a
+    // single short blip, deliberately smaller than every tune above. Those
+    // all read as "come look at this"; a temperature reading just needs to
+    // register as "noted" without competing for attention the way even
+    // Gentle's three-note rise would.
+    static const Note kBeep[] = {
+        {1200, 60, 0},  // one short blip, no second note
+    };
     switch (tune) {
       case JingleTune::Chime: notes = kChime; count = sizeof(kChime) / sizeof(kChime[0]); return;
       case JingleTune::Alert: notes = kAlert; count = sizeof(kAlert) / sizeof(kAlert[0]); return;
       case JingleTune::Fanfare: notes = kFanfare; count = sizeof(kFanfare) / sizeof(kFanfare[0]); return;
       case JingleTune::Gentle: notes = kGentle; count = sizeof(kGentle) / sizeof(kGentle[0]); return;
       case JingleTune::Boarding: notes = kBoarding; count = sizeof(kBoarding) / sizeof(kBoarding[0]); return;
+      case JingleTune::Beep: notes = kBeep; count = sizeof(kBeep) / sizeof(kBeep[0]); return;
       default: notes = nullptr; count = 0; return;
     }
   }

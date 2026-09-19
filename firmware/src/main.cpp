@@ -1,30 +1,28 @@
-// stack-chan/m5stack-avatar on a bare ESP32-WROOM + SSD1306 128x64 OLED.
+// Bare ESP32-WROOM + two SSD1306 128x64 OLEDs: one for the announcer's face
+// (a random portrait, see portrait_face.h), one for the typed message.
 //
-// Core split (the point of this demo):
-//   Core 1 (APP_CPU) - owned entirely by the avatar. m5stack-avatar hardcodes
-//                      both of its FreeRTOS tasks to APP_CPU_NUM in
-//                      Avatar::start() (Avatar.cpp), so rendering and the
-//                      blink/saccade/breath state machine are already pinned
-//                      there. Arduino's loop() also lands on core 1, so it is
-//                      deliberately left empty below.
-//   Core 0 (PRO_CPU) - free for application work. Everything this demo does
-//                      to the avatar happens in appTask, pinned to core 0.
-//                      This is the core to hang TTS, wake-word, an LLM client
-//                      or network I/O off; WiFi/BT stacks also live here.
-//
-// Talking to the avatar across cores is safe for the calls used here:
-// Avatar::setExpression() suspends the draw task before mutating, and the
-// float setters are single-word writes the draw task only reads.
+// Correction, 2026-09-18: this used to run m5stack-avatar's procedural
+// eyes/mouth on the face panel, which is why this file's core split existed
+// - m5stack-avatar hardcodes both of its FreeRTOS tasks (rendering, and the
+// blink/saccade/breath state machine) to APP_CPU_NUM in Avatar::start(), so
+// Core 1 was "owned by the avatar" and everything else had to stay off it.
+// PortraitFace replaced that outright: it draws synchronously, from
+// whichever task calls it (appTask's own loop for idle breathing, a small
+// helper task for the per-message frame cycle - see mqtt_link.h's
+// lipSyncTask), so nothing hardcodes a core anymore. appTask is still
+// pinned to core 0 below, but now only for the same reason the app logic
+// was already there - WiFi/BT stacks live on PRO_CPU, and that's also
+// where TTS/wake-word/LLM-client work would hang off if this grows one.
+// Core 1 just runs Arduino's own (empty) loop() and is otherwise unused.
 
 #include <Arduino.h>
 #include <M5Unified.h>
-#include <Avatar.h>
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <OneButton.h>
 
 #include "ssd1306_display.h"
-#include "small_oled_face.h"
+#include "portrait_face.h"
 #include "speech_bubble.h"
 #include "digital_clock.h"
 #include "mqtt_link.h"
@@ -200,7 +198,11 @@ static U8G2_SSD1306_128X64_NONAME_F_2ND_HW_I2C u8g2Top(U8G2_R0,
                                                         U8X8_PIN_NONE);
 static U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2Bottom(U8G2_R0, U8X8_PIN_NONE,
                                                        OLED_SCL, OLED_SDA);
-static m5avatar::Avatar avatar;
+// The face panel's announcer - a pointer, not a plain static object, since
+// it needs `oled` already init()'d before it can draw its first frame; see
+// its construction in setup(), right where avatar.setFace()/init() used to
+// sit.
+static PortraitFace *portraitFace = nullptr;
 static SpeechBubble *bubble = nullptr;
 // The bubble panel's idle/default face — MqttLink switches back to this once
 // a message has finished displaying (see mqtt_link.h's handleMessage()).
@@ -230,14 +232,15 @@ static DeviceSettings settings;
 // SpeechBubble::show()'s per-character reveal loop without slowing it down.
 static void beepChar() { tone(PIEZO_PIN, 1800, 15); }
 
+// Contract v2's "expression" vocabulary - kept only so MqttLink can keep
+// validating/warning on an unrecognized value, same as always. Used to also
+// select an m5avatar::Expression for the face; PortraitFace has no such
+// per-mood variants, so nothing consumes the matched value anymore - see
+// the constructor comment in mqtt_link.h.
 static const char *const kExpressionNames[] = {"Happy",  "Angry",  "Sad",
                                                "Doubt",  "Sleepy", "Neutral"};
-static const m5avatar::Expression kExpressions[] = {
-    m5avatar::Expression::Happy,  m5avatar::Expression::Angry,
-    m5avatar::Expression::Sad,    m5avatar::Expression::Doubt,
-    m5avatar::Expression::Sleepy, m5avatar::Expression::Neutral};
 static constexpr size_t kExpressionCount =
-    sizeof(kExpressions) / sizeof(kExpressions[0]);
+    sizeof(kExpressionNames) / sizeof(kExpressionNames[0]);
 
 #ifdef AVATAR_DEMO_MODE
 // One line per expression above, in the same order — what the bubble shows
@@ -249,27 +252,42 @@ static const char *const kPhrases[] = {
     "Cheer up - nothing matters.",    "No one's driving. Never was.",
     "Rest easy. Heat death can wait.", "Just meat, doing meat things."};
 
-// Fake lip-sync: drives mouthOpenRatio from a noisy envelope for `ms`.
-// Stand-in for a real TTS/mic amplitude source — this is the hook a
-// text-to-speech engine on core 0 would drive instead.
+// Cycles the announcer through its own frame set for `ms` - the same thing
+// mqtt_link.h's lipSyncTask does for a real message, but driven by hand
+// since this demo mode has no MQTT message triggering that path. Stand-in
+// for what a real TTS engine on core 0 would drive instead.
 static void speakFor(uint32_t ms) {
+  if (portraitFace == nullptr) return;
+  portraitFace->startTalking();
   const uint32_t until = millis() + ms;
   while (millis() < until) {
-    float openRatio = (random(0, 100) / 100.0f);
-    avatar.setMouthOpenRatio(openRatio);
-    vTaskDelay(pdMS_TO_TICKS(random(60, 140)));
+    portraitFace->advanceTalkFrame();
+    vTaskDelay(pdMS_TO_TICKS(150));
   }
-  avatar.setMouthOpenRatio(0.0f);
+  portraitFace->stopTalking();
+}
+
+// Ticks the announcer's idle breathing sway during a demo-loop pause -
+// appTask's real for(;;) loop does this every ~50ms (see below); demoLoop()
+// has no equivalent loop of its own during its plain vTaskDelay() gaps, so
+// without this the face would just sit frozen between phrases.
+static void idleDelay(uint32_t ms) {
+  const uint32_t until = millis() + ms;
+  while (millis() < until) {
+    if (portraitFace != nullptr) portraitFace->tick(millis());
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
 }
 #endif
 
 #ifdef AVATAR_FB_DUMP
 // Debug aid for a headless bench: dump what is actually in the panel's
 // framebuffer as ASCII, since Panel_HasBuffer keeps a readable RAM copy.
-// Build with -DAVATAR_FB_DUMP to enable. Costs nothing when off.
+// Build with -DAVATAR_FB_DUMP to enable. Costs nothing when off. No
+// suspend/resume needed around the read (unlike the old m5avatar version) -
+// PortraitFace has no background draw task to race; it only ever draws
+// synchronously from whichever caller invokes it.
 static void dumpFramebuffer(const char *label) {
-  avatar.suspend();  // freeze the draw task so we read a whole frame
-  delay(120);
   Serial.printf("---- %s ----\n", label);
   for (int y = 0; y < 64; y += 2) {
     char row[129];
@@ -281,7 +299,6 @@ static void dumpFramebuffer(const char *label) {
     row[128] = 0;
     Serial.println(row);
   }
-  avatar.resume();
 }
 
 // Same trick for the bubble panel. Nothing else writes to oledText besides
@@ -309,13 +326,14 @@ static void dumpBubbleFramebuffer(const char *label) {
 static void demoLoop() {
   size_t i = 0;
   for (;;) {
-    const m5avatar::Expression exp = kExpressions[i % kExpressionCount];
-    avatar.setExpression(exp);
+    // Swaps the announcer to a new random face each pass - the same call
+    // MqttLink::revertToIdle() makes after a real announcement.
+    if (portraitFace != nullptr) portraitFace->pickRandom();
     if (bubble != nullptr) {
       bubble->show(kPhrases[i % kExpressionCount]);
     }
 
-    Serial.printf("[core %d] expression=%-8s heap=%6u draw=core %d\n",
+    Serial.printf("[core %d] phrase=%-8s heap=%6u draw=core %d\n",
                   xPortGetCoreID(), kExpressionNames[i % kExpressionCount],
                   (unsigned)ESP.getFreeHeap(), APP_CPU_NUM);
 
@@ -325,20 +343,22 @@ static void demoLoop() {
     dumpBubbleFramebuffer(kExpressionNames[i % kExpressionCount]);
 #endif
 
-    // Every third expression, babble for a bit so the mouth animates.
+    // Every third phrase, babble for a bit so the portrait's own frames
+    // cycle (see speakFor()).
     if (i % 3 == 2) {
       speakFor(1500);
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      idleDelay(1000);
     } else {
-      vTaskDelay(pdMS_TO_TICKS(2500));
+      idleDelay(2500);
     }
     i++;
   }
 }
 #endif
 
-// Everything here runs on core 0 while the avatar renders on core 1 (see the
-// core-split comment at the top of this file).
+// Pinned to core 0 - see the file-header comment for why (WiFi/BT locality,
+// not a hard requirement from PortraitFace, which draws wherever it's called
+// from).
 static void appTask(void *) {
 #ifdef AVATAR_DEMO_MODE
   demoLoop();
@@ -356,7 +376,7 @@ static void appTask(void *) {
   static OneButton button(BUTTON_PIN, /*activeLow=*/true,
                            /*pullupActive=*/true);
 
-  static MqttLink mqttLink(&avatar, bubble, kExpressionNames, kExpressions,
+  static MqttLink mqttLink(portraitFace, bubble, kExpressionNames,
                             kExpressionCount, idleClock, &rgbLed, &button,
                             &jingle, &oled, &oledText);
   // Plays once, right as appTask starts up, before the bubble panel shows
@@ -437,6 +457,7 @@ static void appTask(void *) {
         doc["tz"] = settings.tz;
         doc["holdSeconds"] = settings.messageHoldSeconds;
         doc["keepLast"] = settings.keepLastMessage;
+        doc["textSize"] = settings.messageTextSize;
       });
 
   // Records the BLE identity for the "what am I connected to" summary
@@ -488,6 +509,7 @@ static void appTask(void *) {
                             settings.port, settings.topic);
       mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
                                   settings.keepLastMessage);
+      if (bubble != nullptr) bubble->setTextSize(settings.messageTextSize);
       if (idleClock != nullptr) idleClock->setTimezone(settings.tz);
     }
     mqttLink.loop();
@@ -503,6 +525,11 @@ static void appTask(void *) {
     // a keepLastMessage_ message the moment the wall-clock second changes,
     // undoing it within about a second of it finishing typing.
     if (idleClock != nullptr && !mqttLink.isHoldingMessage()) idleClock->tick();
+    // Idle "breathing" sway for the announcer - no-op while a message is
+    // typing (portraitFace_->talking_, set by lipSyncTask) or the face is
+    // asleep for the night, both tracked inside PortraitFace itself; see
+    // portrait_face.h's tick().
+    if (portraitFace != nullptr) portraitFace->tick(millis());
     // OneButton needs frequent polling to time clicks/long-presses; the 50ms
     // period below is well inside its default click/press timing windows.
     button.tick();
@@ -609,15 +636,31 @@ void setup() {
   u8g2Bottom.begin();
   u8g2Bottom.setContrast(255);
 
+  // Blank both panels immediately after begin(), before either script draws
+  // its first frame. begin() only sends the SSD1306 its init command
+  // sequence - it does not touch GDDRAM - so a chip that stayed powered
+  // through a software reset (upload, a soft reboot, anything short of an
+  // actual power cycle) is still showing whatever was there last session
+  // until something clears it. Corrected 2026-09-19: this used to only
+  // cover u8g2Bottom, right below, on the reasoning that boot::draw()'s own
+  // first-frame clearBuffer()+sendBuffer() (see boot.cpp) would blank
+  // u8g2Top itself within its first ~16ms iteration anyway - true for the
+  // *shadow buffer* M5GFX/U8g2 think they're showing, but this comment's
+  // "restart from software" report is about the *physical* screen, which
+  // this code has no way to read back and confirm empty. Blanking both here
+  // removes the dependency on that first-frame timing entirely rather than
+  // trusting it.
+  u8g2Top.clearBuffer();
+  u8g2Top.sendBuffer();
+  u8g2Bottom.clearBuffer();
+  u8g2Bottom.sendBuffer();
+
   // Beat to hold on each phase's settled last frame before handing off, so
   // POST's cursor and splash's landed title card are actually seen rather
   // than the app cutting away the instant each script ends.
   constexpr uint32_t PHASE_HOLD_MS = 2000;
 
-  // Phase 1: POST alone, on u8g2Top. u8g2Bottom is blanked up front rather
-  // than left showing whatever garbage the SSD1306 powered on with.
-  u8g2Bottom.clearBuffer();
-  u8g2Bottom.sendBuffer();
+  // Phase 1: POST alone, on u8g2Top.
   boot::begin(boot::Info{settings.name.c_str(), settings.ssid.c_str(),
                          settings.host.c_str(), settings.port,
                          settings.topic.c_str()});
@@ -699,34 +742,42 @@ void setup() {
     while (true) delay(1000);
   }
 
-  // Make the OLED M5.Display/M5.Lcd, which is the surface m5stack-avatar
-  // draws to. addDisplay() makes it primary automatically when it is the
-  // first display, but autodetect may have registered one, so be explicit.
+  // Make the OLED M5.Display/M5.Lcd, which is what PortraitFace draws to
+  // below. addDisplay() makes it primary automatically when it is the first
+  // display, but autodetect may have registered one, so be explicit.
   const size_t idx = M5.addDisplay(oled);
   M5.setPrimaryDisplay(idx);
   // Rotation 2 = 180 degrees. Panel is mounted upside down relative to the
-  // SSD1306's native origin, so the avatar renders inverted at rotation 0.
+  // SSD1306's native origin, so the face renders inverted at rotation 0.
   M5.Display.setRotation(2);
   M5.Display.fillScreen(TFT_BLACK);
 
-  // Second panel: the speech bubble. Not made primary, so the avatar never
-  // touches it — accessed only through `bubble` below. If it's missing or at
-  // the wrong address this just logs and carries on without it; the avatar
-  // half of the demo doesn't depend on it. (PIEZO_PIN's pinMode() already
-  // happened at the top of setup(), ahead of the boot-POST beep.)
+  // Second panel: the speech bubble. Not made primary, so the face panel
+  // never touches it — accessed only through `bubble` below. If it's
+  // missing or at the wrong address this just logs and carries on without
+  // it; the face half of the demo doesn't depend on it. (PIEZO_PIN's
+  // pinMode() already happened at the top of setup(), ahead of the
+  // boot-POST beep.)
   if (oledText.init()) {
     M5.addDisplay(oledText);
     oledText.setRotation(2);
+    // Explicit, same as M5.Display.fillScreen() above for `oled` - init()'s
+    // own use_clear default should already cover this, but `oled` gets the
+    // belt-and-suspenders redraw and this panel didn't, which was the one
+    // asymmetry found while chasing the "screen still shows artifacts from
+    // the previous session after a software restart" report (2026-09-19).
+    oledText.fillScreen(TFT_BLACK);
     bubble = new SpeechBubble(&oledText, beepChar);
+    bubble->setTextSize(settings.messageTextSize);
     idleClock = new DigitalClock(&oledText);
     // Not idleClock->begin() here - see digital_clock.h's begin() comment
     // for why starting SNTP this early (well before WiFi.begin() ever runs)
     // is implicated in the intermittent MQTT-connect lwIP crash. No
     // showNow() call either - draw() now shows nothing at all while unsynced
-    // (see digital_clock.h's 2026-09-16 correction), and init() above
-    // already leaves the panel blank, so there's nothing an early call would
-    // put on screen that isn't already there. appTask's real
-    // idleClock->setTimezone() call, after WiFi/MQTT connect, is what
+    // (see digital_clock.h's 2026-09-16 correction), and the fillScreen()
+    // just above already leaves the panel blank, so there's nothing an
+    // early call would put on screen that isn't already there. appTask's
+    // real idleClock->setTimezone() call, after WiFi/MQTT connect, is what
     // actually starts SNTP.
   } else {
     Serial.println(
@@ -734,10 +785,9 @@ void setup() {
         "SCL=15 @0x3C");
   }
 
-  avatar.setFace(new m5avatar::SmallOledFace());
-  // colorDepth 1: render into a 1-bit sprite. Anything else wastes RAM and
-  // gets flattened by the panel anyway.
-  avatar.init(1);
+  // Picks the first random announcer and draws it immediately - see
+  // portrait_face.h.
+  portraitFace = new PortraitFace(&oled);
 
   // RGB status LED: attaches its three LEDC channels and leaves it off until
   // a message asks for a color (see mqtt_link.h's display()). Independent of
@@ -745,17 +795,17 @@ void setup() {
   // panel's init() succeeded.
   rgbLed.begin();
 
-  // Pin app logic to core 0, leaving core 1 to the avatar's own tasks. 8192
-  // rather than the demo's old 4096: WiFi, PubSubClient and ArduinoJson
-  // buffers now share this stack, and the old size overflows silently once
-  // networking is in the mix.
+  // Pin app logic to core 0 - see the file-header comment. 8192 rather than
+  // the demo's old 4096: WiFi, PubSubClient and ArduinoJson buffers now
+  // share this stack, and the old size overflows silently once networking
+  // is in the mix.
   xTaskCreatePinnedToCore(appTask, "appTask", 8192, nullptr, 1, nullptr,
                           PRO_CPU_NUM);
 }
 
 void loop() {
-  // Intentionally empty. Arduino's loopTask runs on core 1, which belongs to
-  // the avatar; app work goes in appTask on core 0.
+  // Intentionally empty. Arduino's loopTask runs on core 1; app work goes in
+  // appTask on core 0 instead - see the file-header comment.
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
 #endif  // RGB_LED_TEST

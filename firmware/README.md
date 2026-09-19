@@ -9,14 +9,40 @@ to this directory and remain correct; `../docs/index.html` is the exception,
 since the control page stays at the repo root for GitHub Pages.
 
 This file used to be titled "avatar-demo", after the project this started as.
-The device is called mqttchan; `avatar/say` remains the MQTT topic, and
-`m5stack-avatar` remains the rendering library.
+The device is called mqttchan; `avatar/say` remains the MQTT topic.
 
-[stack-chan/m5stack-avatar](https://github.com/stack-chan/m5stack-avatar) running
-on a bare ESP-WROOM-32 with a 128x64 SSD1306 I2C OLED — no M5Stack hardware
-involved. A second SSD1306 shows what's "said" as a word-wrapped speech
-bubble (see "The speech bubble" below) — optional, and everything below runs
-fine without it wired up.
+**Correction, 2026-09-18:** this file used to say `m5stack-avatar` "remains
+the rendering library" and described the face panel throughout as procedural
+eyes/mouth driven by `Avatar::setExpression()`/`setMouthOpenRatio()`. That's
+no longer true: the face panel now shows a random bitmap portrait from the
+bundled "1-bit dialogue portraits" pack instead (`include/portrait_face.h`,
+`include/portraits_data.h`) - a slow "breathing" bob while idle, punctuated
+every few seconds by a quick blink (added 2026-09-19: a flash to the
+character's own second frame, the closest thing to eyes-closed the pack has -
+or, for the two characters with only one frame, a small head-nod dip instead,
+so idle never looks perfectly frozen regardless of how many frames a given
+character shipped with), cycling through that character's own 1-4 frames
+while a message types, and a new random character picked each time an
+announcement finishes. Build-verified only so far - not yet looked at on the
+board. `m5stack-avatar`
+and its `Avatar.h`/`SmallOledFace` are gone from the build entirely
+(`platformio.ini`'s `lib_deps` no longer pulls it in). The old reading was
+believable because it was true from this project's start through
+2026-09-17 - this is a deliberate swap, not a regression. The rest of this
+document (core split, MQTT contract, expressions, demo mode) was written
+against the old library and has not been fully re-verified against the new
+one; `include/portrait_face.h`, `include/mqtt_link.h` and `src/main.cpp` are
+the current source of truth where the two disagree. Notably, "expression" in
+the MQTT payload is still parsed and validated the same as before, but no
+longer selects anything on the face - see the constructor comment in
+`mqtt_link.h`.
+
+[stack-chan/m5stack-avatar](https://github.com/stack-chan/m5stack-avatar) used
+to run on a bare ESP-WROOM-32 with a 128x64 SSD1306 I2C OLED — no M5Stack
+hardware involved; see the correction above for what replaced it. A second
+SSD1306 shows what's "said" as a word-wrapped speech bubble (see "The speech
+bubble" below) — optional, and everything below runs fine without it wired
+up.
 
 By default the board joins WiFi, subscribes to an MQTT topic, and drives the
 avatar + bubble from whatever `{"text":..., "expression":...}` JSON arrives
@@ -204,6 +230,18 @@ group (`../docs/index.html`) same as message hold time/keep-last-message; takes
 effect on the next message shown, not retroactively on whatever's already on
 screen. Not yet verified live — build-verified only so far, unlike the rest
 of this section.
+
+**Correction, 2026-09-19:** a report from the board described Large text's
+second line as "garbled" once a message ran long enough to scroll. Chasing it
+turned up no corruption in `SpeechBubble`'s own model: a RAM-shadow-buffer
+dump (`dumpBubbleFramebuffer`) taken after a real multi-scroll run on the
+board showed both visible lines cleanly separated, and the `scroll()`/
+`copyRect()` math checked out by hand too. Rather than ship nothing against a
+report that real, `show()` now explicitly wipes each line's own rect
+immediately before drawing into it (see the comment in `speech_bubble.h`) -
+cheap, safe, and it closes the most plausible gap even though the exact
+mechanism wasn't confirmed. Still wants an actual look at the board to
+confirm the report is gone, not just unreproduced in software.
 
 ## How it was made to work on a non-M5 panel
 
@@ -451,8 +489,37 @@ Three changes, on top of the physical-panel-reversal correction just above:
   T_FLASH+D_FLASH)` window and a naive time-window match would double-fire
   the slam beat instead of the mark beat.
 
-`pio run` builds clean at 45.6% flash / 19.9% RAM (consistent with the
-figures above).
+**Correction, 2026-09-19:** a report described the screen showing leftover
+content from the previous session after restarting from software (upload, or
+any reset that doesn't cut power) rather than a real power cycle. Both
+`u8g2Top` and `u8g2Bottom` are now explicitly blanked (`clearBuffer()` +
+`sendBuffer()`) right after `begin()`, before either script's first frame -
+previously only `u8g2Bottom` got this, on the reasoning that `boot::draw()`'s
+own per-frame clear would blank `u8g2Top` within its first ~16ms anyway. That
+reasoning covers the *shadow buffer* the two libraries think they're showing,
+not the SSD1306's own GDDRAM, which stays powered (and keeps whatever was in
+it) across exactly this kind of reset - there's no way for this code to read
+that back and confirm it's actually clear, hence blanking explicitly rather
+than trusting the timing. The app-mode `oledText` panel got the same
+treatment (an explicit `fillScreen()` after `init()`, matching what `oled`
+already had) for the same reason. Not confirmed against the actual reported
+symptom - this session has no camera, and the fix is defensive against every
+plausible read of "restart from software," not a targeted patch for a
+diagnosed single cause.
+
+**Corrected 2026-09-19:** this used to say `pio run` builds clean at 45.6%
+flash / 19.9% RAM. Measured again today (contract v2 build plus the blink,
+beep, line-height and boot-clear changes above): **48.8% flash / 20.0% RAM**
+(1,534,083 / 3,145,728 bytes flash, 65,452 / 327,680 bytes RAM). The old
+number was believable because it was true at the time — flash usage just
+grows as features do, and 3.5 points isn't the kind of jump worth digging
+into.
+
+Verified live 2026-09-19 (same board, `Ziggy`, `10.0.0.114`): `pio run -t
+upload` flashed successfully, and a DTR/RTS-reset serial capture reached
+"WiFi: connected" → "MQTT: connected and subscribed" → "BLE: advertising"
+with no crash - same result as the 2026-09-15 check below, re-run after this
+session's changes rather than assumed still true.
 
 Verified live 2026-09-15: `pio run -t upload` flashed successfully. Two
 back-to-back DTR/RTS-reset serial captures both reached "WiFi: connected" →
@@ -540,8 +607,8 @@ four-value enum was the only thing in the way.
 
 `"jingle"` is also optional and picks a short notification tune to play on
 the piezo (`PIEZO_PIN`) right as the message starts showing, before its text
-begins typing — `"chime"`, `"alert"`, `"fanfare"`, `"gentle"`, or `"boarding"`;
-omit it (or leave it `""`, the default) to play nothing. Each tune runs
+begins typing — `"chime"`, `"alert"`, `"fanfare"`, `"gentle"`, `"boarding"`, or
+`"beep"`; omit it (or leave it `""`, the default) to play nothing. Each tune runs
 synchronously and finishes in well under a second, so it never overlaps
 `beepChar()`'s own per-character tone() calls on the same pin. An unrecognized
 `"jingle"` string logs a warning and plays nothing, same fallback as
@@ -565,6 +632,34 @@ practice it plays for every aircraft arrival and departure.
 This confirms parsing and that a tune plays, not what it sounds like through
 the piezo — nobody listened to the board for this check, so "discreet
 PA chime" above is a description of the note table, not an ear-verified claim.
+
+**`"beep"` (added 2026-09-19)** is a single ~60ms blip, deliberately smaller
+than every other tune — see `include/jingle.h`'s `kBeep`. It's the API's
+presentation for `kind: "sensor.reading"` (`services/api/src/triage.ts`),
+alongside a green (`#00ff00`) LED: today only `services/feeds/ha-temperature`
+sends that kind, so in practice this plays for every room-temperature update
+that changed enough to report. That kind used to be fully silent and dark
+(`QUIET`) — changed because indistinguishable-from-off wasn't actually
+useful feedback that a reading came in. Getting this to fire at all also
+needed `presentationFor()`'s `low`-priority handling changed: it used to
+unconditionally strip the jingle off any `low`-priority message (the feed
+always sends `sensor.reading` at `low`), which would have silenced this
+right back — see the comment above that function for why the blanket strip
+was removed instead of special-cased.
+
+**Verified live 2026-09-19** on the same board (`Ziggy`, `10.0.0.114`), same
+method as the 2026-09-17/18 tables: publish to `avatar/say`, read the serial
+log, negative control included.
+
+| Published | Serial output |
+|---|---|
+| `{"led":"#00ff00","jingle":"beep",...}` | silent — parsed, tune plays |
+| `{"led":"#00ff00","jingle":"boop",...}` | warned and fell back, same as before |
+
+Same caveat as the other tables: this confirms parsing, not what the beep
+sounds like or whether the LED actually reads as green through the
+unmatched-resistor tint mentioned above — nobody looked at or listened to
+the board for this check.
 
 Config lives in `include/secrets.h` (gitignored — copy `secrets.h.example`
 and fill in `WIFI_SSID`/`WIFI_PASS`/`MQTT_HOST`/`MQTT_PORT`/`MQTT_TOPIC`).

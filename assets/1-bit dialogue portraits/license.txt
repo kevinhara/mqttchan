@@ -1,0 +1,14 @@
+License: Custom Commercial Asset License. 
+
+This work is licensed under a custom license inspired by Creative Commons. 
+You are free to:
+	•	Use — in personal and commercial projects.
+	•	Modify — edit, adapt, and build upon the assets. 
+Under the following terms:
+	•	No Redistribution (NR) — You may NOT sell, share, sublicense, or distribute the assets as standalone files, whether original or modified.
+	•	No Asset Packs — You may NOT include the assets in any asset pack, library, or collection intended for redistribution or resale.
+	•	No Extraction — You may not use the assets in a way that allows others to extract and reuse them as standalone assets.
+Attribution:
+	•	Not required, but appreciated.
+
+

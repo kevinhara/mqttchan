@@ -3,10 +3,17 @@ import { presentationFor } from "../src/triage.js";
 
 describe("triage", () => {
   it("keeps ambient readings silent and dark", () => {
-    const p = presentationFor("sensor.reading", "low");
+    const p = presentationFor("ambient", "low");
     expect(p.jingle).toBe("");
     expect(p.led).toBe("");
     expect(p.expression).toBe("neutral");
+  });
+
+  it("gives a sensor reading a quiet beep and a green LED", () => {
+    const p = presentationFor("sensor.reading", "low");
+    expect(p.jingle).toBe("beep");
+    expect(p.led).toBe("#00ff00");
+    expect(p.blink).toBe(false);
   });
 
   it("falls back for an unknown kind instead of throwing", () => {
@@ -27,8 +34,8 @@ describe("triage", () => {
     expect(p.jingle).toBe("fanfare");
   });
 
-  it("strips the jingle at low priority", () => {
-    expect(presentationFor("alert", "low").jingle).toBe("");
+  it("leaves a kind's own jingle alone at low priority", () => {
+    expect(presentationFor("alert", "low").jingle).toBe("alert");
   });
 
   it("emits only lowercase expressions", () => {

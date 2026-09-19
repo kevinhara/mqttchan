@@ -32,8 +32,20 @@ const QUIET: Presentation = {
 const BY_KIND: Record<string, Presentation> = {
   /** Background information nobody needs to act on. Deliberately silent. */
   ambient: QUIET,
-  /** A sensor value changed. Same treatment: seen, not announced. */
-  "sensor.reading": QUIET,
+  /**
+   * A sensor value changed - today, always a `ha-temperature` room reading
+   * (see `services/feeds/ha-temperature`). Changed 2026-09-19 from QUIET
+   * ("seen, not announced") to a single quiet beep + green LED: fully silent
+   * made a temperature update indistinguishable from the device being off,
+   * and green (rather than any of `notice`/`alert`/`celebrate`'s colors)
+   * reads as "routine, nothing to act on" at a glance.
+   */
+  "sensor.reading": {
+    expression: "neutral",
+    led: "#00ff00",
+    blink: false,
+    jingle: "beep",
+  },
   /**
    * Something worth looking up for. `boarding` (added 2026-09-18) is the
    * default here rather than `chime` because the flights feed is currently
@@ -67,9 +79,17 @@ export function knownKinds(): string[] {
 }
 
 /**
- * Priority modifies the kind's presentation rather than replacing it:
+ * Priority modifies the kind's presentation only by escalating - a kind's own
+ * jingle/LED (or lack of one) already encodes how much attention it deserves,
+ * so `normal`/`low` both leave it untouched:
  *   - `high` guarantees the message is noticeable even if its kind is quiet.
- *   - `low` strips the jingle, so ambient chatter never makes noise.
+ *   - `low` used to unconditionally strip the jingle too ("so ambient chatter
+ *     never makes noise"), which was fine while every low-priority kind was
+ *     QUIET anyway - but `ha-temperature` always sends `sensor.reading` at
+ *     `low` (see services/feeds/ha-temperature), so once that kind got its
+ *     own beep (2026-09-19), the blanket strip would have silenced it right
+ *     back. Removed rather than special-cased: nothing else relies on `low`
+ *     muting a kind that wants to make noise.
  * Ordering within the queue is handled separately, in queue.ts.
  */
 export function presentationFor(kind: string, priority: Priority): Presentation {
@@ -81,9 +101,6 @@ export function presentationFor(kind: string, priority: Priority): Presentation 
       led: base.led === "" ? "#ff0000" : base.led,
       jingle: base.jingle === "" ? "alert" : base.jingle,
     };
-  }
-  if (priority === "low") {
-    return { ...base, jingle: "" };
   }
   return base;
 }
