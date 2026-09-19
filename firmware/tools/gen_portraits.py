@@ -26,6 +26,19 @@ recovered automatically and then spot-checked by eye:
 99 characters, 1-4 frames each, 225 files total. Re-run this whole process
 (not just re-embed _GROUPS by hand) if the pack is ever replaced - the
 threshold was tuned against this specific pack's dither pattern.
+
+Two characters (index 44 and 66 below - portraits 112 and 156) ship only one
+frame each, i.e. no second frame for PortraitFace's idle blink to flash to.
+Rather than exclude them from blinking, _SYNTHETIC_BLINKS below synthesizes
+one: for each character, one or more (x0, y0, x1, y1) boxes hand-picked by
+eye (pun noted) against that character's own art - see the box-finding
+crops this was done with, not kept in the repo, but reproducible by cropping
++ upscaling the source PNG around the eye and reading pixel coordinates off
+a grid overlay. make_blink() below fills each box solid (closing the eye)
+and cuts a thin light line back through its vertical middle (an eyelid
+crease) - the same flat "line on an otherwise dark shape" convention this
+pack already uses elsewhere. Added 2026-09-19 after a first pass gave these
+two a head-nod instead of a blink, which wasn't what was asked for.
 """
 import pathlib
 
@@ -38,6 +51,31 @@ OUT_PATH = SCRIPT_DIR.parent / "include" / "portraits_data.h"
 
 W = H = 64
 ROW_BYTES = (W + 7) // 8  # 8, since W is byte-aligned
+
+# Character index (position in _GROUPS below) -> eye box(es) in source-image
+# (64x64) coordinates, (x0, y0, x1, y1), half-open like a Python slice. See
+# the module docstring.
+_SYNTHETIC_BLINKS = {
+    44: [(16, 21, 29, 37), (35, 21, 48, 37)],  # portrait 112, two eyes
+    66: [(9, 31, 16, 39)],  # portrait 156, one eye (3/4 profile)
+}
+
+
+def make_blink(im, boxes, line_height=2):
+    """Returns a copy of grayscale image `im` with each eye box closed - see
+    _SYNTHETIC_BLINKS above."""
+    im = im.copy()
+    px = im.load()
+    for x0, y0, x1, y1 in boxes:
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                px[x, y] = 0
+        mid = (y0 + y1) // 2
+        for y in range(mid, mid + line_height):
+            for x in range(x0 + 2, x1 - 2):
+                px[x, y] = 255
+    return im
+
 
 # See the module docstring for how this was derived.
 _GROUPS = [
@@ -62,18 +100,24 @@ _GROUPS = [
 ]
 
 
-def pack_bits(portrait_num):
-    """Packs one portrait PNG into LGFX's drawBitmap() format: 1bpp,
+def load_gray(portrait_num):
+    """Loads one portrait PNG flattened onto white, as a grayscale image -
+    the shared first step for pack_bits() and make_blink()."""
+    im = Image.open(ASSET_DIR / f"portrait {portrait_num}.png").convert("RGBA")
+    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+    bg.paste(im, (0, 0), im)
+    return bg.convert("L")
+
+
+def pack_bits(im):
+    """Packs one grayscale image into LGFX's drawBitmap() format: 1bpp,
     MSB-first per byte, rows padded to a byte boundary - verified against
     LGFXBase::draw_bitmap() in M5GFX, and round-tripped pixel-for-pixel
     against the source art. A pixel is "on" (bit set, drawn in the fg
     color) wherever the source art is dark ink, so it renders as lit
     (white) linework on the OLED's black background - see portrait_face.h.
     """
-    im = Image.open(ASSET_DIR / f"portrait {portrait_num}.png").convert("RGBA")
-    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
-    bg.paste(im, (0, 0), im)
-    px = bg.convert("L").load()
+    px = im.load()
     out = []
     for y in range(H):
         for b in range(ROW_BYTES):
@@ -94,7 +138,9 @@ def main():
 // portraits" pack (assets/1-bit dialogue portraits/x2 64x64px/*.png at the
 // repo root; see that folder's license.txt for terms). Do not hand-edit -
 // re-run the generator (see its module docstring for how the frame
-// grouping below was derived) if the source pack changes.
+// grouping below was derived) if the source pack changes. A couple of
+// frames (marked below) are synthetic, not from the pack - see
+// _SYNTHETIC_BLINKS in the generator.
 #pragma once
 
 #include <stdint.h>
@@ -108,15 +154,35 @@ constexpr int kHeight = 64;
 '''
     lines = [header]
 
+    synthetic_frames = 0
     char_frame_vars = []
     for ci, group in enumerate(_GROUPS):
         frame_vars = []
+        last_im = None
         for fi, portrait_num in enumerate(group):
-            bits = pack_bits(portrait_num)
+            last_im = load_gray(portrait_num)
+            bits = pack_bits(last_im)
             varname = f"kFrame_{ci}_{fi}"
             hexes = ", ".join(f"0x{b:02x}" for b in bits)
             lines.append(f"static const uint8_t {varname}[] = {{{hexes}}};\n")
             frame_vars.append(varname)
+
+        boxes = _SYNTHETIC_BLINKS.get(ci)
+        if boxes is not None:
+            assert len(group) == 1, (
+                f"character {ci} has a synthetic blink box but already has "
+                f"{len(group)} real frames - drop it from _SYNTHETIC_BLINKS"
+            )
+            bits = pack_bits(make_blink(last_im, boxes))
+            varname = f"kFrame_{ci}_{len(frame_vars)}"
+            hexes = ", ".join(f"0x{b:02x}" for b in bits)
+            lines.append(
+                f"static const uint8_t {varname}[] = {{{hexes}}};  "
+                f"// synthetic blink, see _SYNTHETIC_BLINKS\n"
+            )
+            frame_vars.append(varname)
+            synthetic_frames += 1
+
         char_frame_vars.append(frame_vars)
     lines.append("\n")
 
@@ -140,7 +206,11 @@ constexpr int kHeight = 64;
 
     OUT_PATH.write_text("".join(lines))
     print(f"wrote {OUT_PATH}")
-    print(f"characters: {len(_GROUPS)}, total frames: {sum(len(g) for g in _GROUPS)}")
+    print(
+        f"characters: {len(_GROUPS)}, "
+        f"total frames: {sum(len(g) for g in _GROUPS) + synthetic_frames} "
+        f"({synthetic_frames} synthetic)"
+    )
 
 
 if __name__ == "__main__":
