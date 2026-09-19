@@ -210,9 +210,6 @@
     <h2>Send message</h2>
     <textarea v-model="text" :placeholder="`What should ${settings.name || 'the avatar'} say?`" maxlength="200"></textarea>
     <div class="row">
-      <select v-model="expression">
-        <option v-for="e in expressions" :key="e.value" :value="e.value">{{ e.label }}</option>
-      </select>
       <button :disabled="!connected || sendBusy" @click="send">Send</button>
     </div>
     <div class="row">
@@ -260,6 +257,37 @@
             <select v-model.number="settings.textSize" :disabled="!connected">
               <option v-for="s in textSizes" :key="s.value" :value="s.value">{{ s.label }}</option>
             </select>
+          </div>
+        </div>
+      </details>
+
+      <details class="settings-group">
+        <summary>Screen</summary>
+        <div class="settings-group-body">
+          <div class="field">
+            <label>Brightness: {{ settings.brightness }}%</label>
+            <input type="range" min="5" max="100" step="5" v-model.number="settings.brightness"
+                   :disabled="!connected" />
+          </div>
+          <div class="row">
+            <div class="field" style="flex: 1;">
+              <label>Screen off from</label>
+              <input type="time" v-model="settings.screenOffStart" :disabled="!connected" />
+            </div>
+            <div class="field" style="flex: 1;">
+              <label>until</label>
+              <input type="time" v-model="settings.screenOffEnd" :disabled="!connected" />
+            </div>
+          </div>
+          <p class="hint">
+            Both panels power off during this window to avoid lighting up a room overnight.
+            Set the same time for both to keep the screens on all the time.
+          </p>
+          <div class="field checkbox-field">
+            <label>
+              <input type="checkbox" v-model="settings.wakeForMessage" :disabled="!connected" />
+              Wake the screens for an incoming message during screen-off hours
+            </label>
           </div>
         </div>
       </details>
@@ -324,25 +352,13 @@
 <script>
 const { createApp, ref, reactive, computed } = Vue;
 
-// Same broker/topic/expression set the firmware uses (include/secrets.h,
-// src/main.cpp) — browsers can't speak raw MQTT/TCP, so MQTT mode connects
-// over the WebSocket listener Caddy fronts at wss://mqtt.kev.nz, per
+// Same broker/topic the firmware uses (include/secrets.h, src/main.cpp) —
+// browsers can't speak raw MQTT/TCP, so MQTT mode connects over the
+// WebSocket listener Caddy fronts at wss://mqtt.kev.nz, per
 // Homelab/osmo/mosquitto/README.md. This is the "no hardware nearby" dev path;
 // it can't reach device settings, which only exist over the BLE GATT link.
 const BROKER_URL = "wss://mqtt.kev.nz/";
 const MQTT_TOPIC = "avatar/say";
-// Lowercase is canonical as of contract v2 (2026-09-17): display() in
-// firmware/include/mqtt_link.h matches with strcasecmp, so the capitalized
-// spellings this page used to send still work - they are just no longer the
-// spelling anything writes down.
-const EXPRESSIONS = [
-  { value: "happy", label: "Happy" },
-  { value: "angry", label: "Angry" },
-  { value: "sad", label: "Sad" },
-  { value: "doubt", label: "Doubt" },
-  { value: "sleepy", label: "Sleepy" },
-  { value: "neutral", label: "Neutral" },
-];
 
 // Matches ledSpecFromString() in firmware/include/mqtt_link.h. "" (sent as an
 // empty string, same as omitting "led" entirely) leaves the LED off, "cycle" is
@@ -377,7 +393,31 @@ const JINGLES = [
   // separately, since both were just a missing list entry away from working.
   { value: "boarding", label: "Boarding" },
   { value: "beep", label: "Beep" },
+  // Added 2026-09-19 alongside jingle.h's kCoin/kOneUp/kStageClear/kDescend/
+  // kTrill - none of the five are wired to a kind in triage.ts yet, so this
+  // is the only way to hear them for now.
+  { value: "coin", label: "Coin" },
+  { value: "oneup", label: "1-Up" },
+  { value: "stageclear", label: "Stage Clear" },
+  { value: "descend", label: "Descend" },
+  { value: "trill", label: "Trill" },
 ];
+
+// screenOffStart/screenOffEnd go over the wire as minutes-since-midnight
+// (matching DeviceSettings::screenOffStart/screenOffEnd in
+// firmware/include/device_settings.h), but the <input type="time"> controls
+// above want "HH:MM" strings - these two convert between the two right at
+// the BLE read/write boundary, same idea as ledValue's computed() above for
+// the LED field's own on-wire representation.
+function minutesToTimeStr(mins) {
+  const h = Math.floor(mins / 60) % 24;
+  const m = mins % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+function timeStrToMinutes(str) {
+  const [h, m] = (str || "0:0").split(":").map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
 
 // Must match include/ble_config.h exactly - these are the firmware's GATT
 // service/characteristic UUIDs, not placeholders.
@@ -411,7 +451,6 @@ createApp({
     const deviceStatus = ref("");
 
     const text = ref("");
-    const expression = ref(EXPRESSIONS[0].value);
     const ledMode = ref("");
     const ledHex = ref("#ff8800");
     // What actually goes on the wire: "" / "cycle" / "#rrggbb".
@@ -438,6 +477,8 @@ createApp({
     const settings = reactive({
       name: "", ssid: "", pass: "", host: "", port: 0, topic: "",
       tz: "", holdSeconds: 30, keepLastMessage: false, textSize: 1,
+      brightness: 100, screenOffStart: "00:00", screenOffEnd: "07:00",
+      wakeForMessage: true,
     });
     const saving = ref(false);
     const saveStatusText = ref("");
@@ -565,6 +606,10 @@ createApp({
       settings.holdSeconds = doc.holdSeconds ?? 30;
       settings.keepLastMessage = doc.keepLast ?? false;
       settings.textSize = doc.textSize ?? 1;
+      settings.brightness = doc.brightness ?? 100;
+      settings.screenOffStart = minutesToTimeStr(doc.screenOffStart ?? 0);
+      settings.screenOffEnd = minutesToTimeStr(doc.screenOffEnd ?? 420);
+      settings.wakeForMessage = doc.wakeForMessage ?? true;
       settings.pass = "";
     }
 
@@ -601,6 +646,10 @@ createApp({
       doc.holdSeconds = settings.holdSeconds;
       doc.keepLast = settings.keepLastMessage;
       doc.textSize = settings.textSize;
+      doc.brightness = settings.brightness;
+      doc.screenOffStart = timeStrToMinutes(settings.screenOffStart);
+      doc.screenOffEnd = timeStrToMinutes(settings.screenOffEnd);
+      doc.wakeForMessage = settings.wakeForMessage;
 
       saving.value = true;
       saveStatusText.value = "";
@@ -642,7 +691,6 @@ createApp({
       sending.value = true;
       const payload = JSON.stringify({
         text: text.value,
-        expression: expression.value,
         led: ledValue.value,
         blink: ledBlink.value,
         jingle: jingle.value,
@@ -665,7 +713,7 @@ createApp({
       mode, bleSupported, switchMode,
       connected, connecting, statusText, statusClass, deviceStatus,
       connect, disconnect,
-      text, expression, expressions: EXPRESSIONS, ledBlink,
+      text, ledBlink,
       ledMode, ledHex, ledValue, ledModes: LED_MODES,
       jingle, jingles: JINGLES, lastSent, send, sendBusy, textSizes: TEXT_SIZES,
       settings, saving, saveStatusText, saveStatusClass, saveSettings,

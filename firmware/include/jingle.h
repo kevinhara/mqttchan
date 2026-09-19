@@ -11,7 +11,20 @@
 // Mirrors the "jingle" string a message payload can carry (see
 // MqttLink::parseMessage()'s jingleFromString()). None means the message
 // didn't ask for a jingle, so nothing plays.
-enum class JingleTune { None, Chime, Alert, Fanfare, Gentle, Boarding, Beep };
+enum class JingleTune {
+  None,
+  Chime,
+  Alert,
+  Fanfare,
+  Gentle,
+  Boarding,
+  Beep,
+  Coin,
+  OneUp,
+  StageClear,
+  Descend,
+  Trill,
+};
 
 class Jingle {
  public:
@@ -113,6 +126,49 @@ class Jingle {
     static const Note kBeep[] = {
         {1200, 60, 0},  // one short blip, no second note
     };
+    // Added 2026-09-19, not yet wired to any kind in triage.ts - a bigger
+    // catalog to pick from next time a feed needs a distinct voice, not a
+    // change to what plays today. Not yet verified live on the board - see
+    // firmware/README.md's jingle table.
+    //
+    // The three below are Mario Bros SFX, transcribed by ear rather than from
+    // a reference - close enough to read as "that game" on a piezo buzzer,
+    // not a faithful reproduction.
+    static const Note kCoin[] = {
+        {988, 70, 30},    // B5
+        {1319, 200, 0},   // E6 - the coin "ding"
+    };
+    static const Note kOneUp[] = {
+        {659, 100, 20},   // E5
+        {784, 100, 20},   // G5
+        {1319, 100, 20},  // E6
+        {1047, 100, 20},  // C6
+        {1175, 100, 20},  // D6
+        {1568, 260, 0},   // G6 - the 1-up run, held on top
+    };
+    static const Note kStageClear[] = {
+        {659, 90, 20},    // E5
+        {784, 90, 20},    // G5
+        {988, 90, 20},    // B5
+        {1319, 90, 20},   // E6
+        {1568, 280, 0},   // G6 - victory run, held on top
+    };
+    // A deliberate mirror of Gentle's rise, for the opposite occasion - a
+    // soft three-note fall for "resolved/cleared" rather than "here's
+    // something new."
+    static const Note kDescend[] = {
+        {659, 260, 80},   // E5
+        {554, 260, 80},   // C#5
+        {440, 380, 0},    // A4 - soft, unhurried three-note fall
+    };
+    // Two notes alternated twice, for "worth a second look" - busier than
+    // Chime's single descending phrase but not sharp like Alert's beeps.
+    static const Note kTrill[] = {
+        {784, 90, 40},    // G5
+        {1047, 90, 40},   // C6
+        {784, 90, 40},    // G5
+        {1047, 220, 0},   // C6 - held on the landing
+    };
     switch (tune) {
       case JingleTune::Chime: notes = kChime; count = sizeof(kChime) / sizeof(kChime[0]); return;
       case JingleTune::Alert: notes = kAlert; count = sizeof(kAlert) / sizeof(kAlert[0]); return;
@@ -120,6 +176,11 @@ class Jingle {
       case JingleTune::Gentle: notes = kGentle; count = sizeof(kGentle) / sizeof(kGentle[0]); return;
       case JingleTune::Boarding: notes = kBoarding; count = sizeof(kBoarding) / sizeof(kBoarding[0]); return;
       case JingleTune::Beep: notes = kBeep; count = sizeof(kBeep) / sizeof(kBeep[0]); return;
+      case JingleTune::Coin: notes = kCoin; count = sizeof(kCoin) / sizeof(kCoin[0]); return;
+      case JingleTune::OneUp: notes = kOneUp; count = sizeof(kOneUp) / sizeof(kOneUp[0]); return;
+      case JingleTune::StageClear: notes = kStageClear; count = sizeof(kStageClear) / sizeof(kStageClear[0]); return;
+      case JingleTune::Descend: notes = kDescend; count = sizeof(kDescend) / sizeof(kDescend[0]); return;
+      case JingleTune::Trill: notes = kTrill; count = sizeof(kTrill) / sizeof(kTrill[0]); return;
       default: notes = nullptr; count = 0; return;
     }
   }

@@ -56,3 +56,22 @@ services:
       API_URL: http://api:8420
       POLL_INTERVAL_MS: "60000"
     command: ["node", "feeds/ha-temperature/dist/index.js"]
+
+  # Sun/moon/planet digest, aurora-relevant Kp index, and MetService severe
+  # weather watches/warnings for Queenstown. No API key needed for any of
+  # this - see feeds/sky/README.md for what still does (weather conditions).
+  feed-sky:
+    image: mqttchan-services
+    container_name: mqttchan-feed-sky
+    restart: unless-stopped
+    depends_on: [api]
+    env_file: .env
+    environment:
+      API_URL: http://api:8420
+      LOCATION_NAME: "Queenstown, Otago, NZ"
+      LOCATION_LAT: "-45.0311"
+      LOCATION_LON: "168.6626"
+      LOCATION_ELEVATION_M: "310"
+      LOCATION_TIMEZONE: "Pacific/Auckland"
+      POLL_INTERVAL_MS: "600000"
+    command: ["node", "feeds/sky/dist/index.js"]

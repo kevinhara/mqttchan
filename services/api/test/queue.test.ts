@@ -59,16 +59,16 @@ describe("pacing", () => {
 
   it("gives a long message more room than a short one", () => {
     const h = harness();
-    const short = h.queue.estimateDisplayMs({ text: "hi", expression: "neutral", led: "", blink: false, jingle: "" });
-    const long = h.queue.estimateDisplayMs({ text: "x".repeat(200), expression: "neutral", led: "", blink: false, jingle: "" });
+    const short = h.queue.estimateDisplayMs({ text: "hi", led: "", blink: false, jingle: "" });
+    const long = h.queue.estimateDisplayMs({ text: "x".repeat(200), led: "", blink: false, jingle: "" });
     // ~45ms/char of typing, so 198 extra chars is ~8.9s more.
     expect(long - short).toBeGreaterThan(8000);
   });
 
   it("counts the jingle against the gap", () => {
     const h = harness();
-    const withJingle = h.queue.estimateDisplayMs({ text: "hi", expression: "neutral", led: "", blink: false, jingle: "alert" });
-    const without = h.queue.estimateDisplayMs({ text: "hi", expression: "neutral", led: "", blink: false, jingle: "" });
+    const withJingle = h.queue.estimateDisplayMs({ text: "hi", led: "", blink: false, jingle: "alert" });
+    const without = h.queue.estimateDisplayMs({ text: "hi", led: "", blink: false, jingle: "" });
     expect(withJingle).toBeGreaterThan(without);
   });
 });

@@ -1,4 +1,4 @@
-// Subscribes to a single MQTT topic carrying {"text":..., "expression":...}
+// Subscribes to a single MQTT topic carrying {"text":..., "led":..., ...}
 // JSON and drives the announcer face + speech bubble from whatever arrives.
 // Owns WiFi and MQTT connect/reconnect; call begin() once from setup-time
 // code and loop() repeatedly from appTask.
@@ -45,24 +45,19 @@ class MqttLink {
   // SSD1306 sleep/wake command overnight — see there. nullptr just skips
   // that entirely, same "optional peripheral" treatment as clock/led/jingle.
   //
-  // expressionNames/expressionCount is still the six-word "expression"
-  // vocabulary from contract v2 (see README.md/docs/index.html's dropdown) —
-  // kept purely so display() can keep validating/warning on an unrecognized
-  // value the same way it always has. It no longer selects anything on the
-  // face: the portrait pack has no per-mood variants, so a recognized
-  // "expression" is now accepted and silently has no visual effect, the
-  // same as it did nothing before for anyone not on the m5avatar face this
-  // replaced. Night/day still affects the face - see setSleeping() below -
-  // but that's driven by the clock, not by this field.
+  // Contract v2's "expression" field (happy/angry/sad/doubt/sleepy/neutral)
+  // is gone as of 2026-09-19: it stopped driving anything the moment the
+  // portrait pack replaced m5avatar's procedural eyes/mouth (see
+  // portrait_face.h), and this removes the vestigial parse/validate-only
+  // path it was left with since. Night/day still affects the face - see
+  // setSleeping() below - but that's driven by the clock, not by a field in
+  // the message.
   MqttLink(PortraitFace *portraitFace, SpeechBubble *bubble,
-           const char *const *expressionNames, size_t expressionCount,
            DigitalClock *clock = nullptr, RgbLed *led = nullptr,
            OneButton *button = nullptr, Jingle *jingle = nullptr,
            M5GFX *faceDisplay = nullptr, M5GFX *textDisplay = nullptr)
       : portraitFace_(portraitFace),
         bubble_(bubble),
-        names_(expressionNames),
-        count_(expressionCount),
         clock_(clock),
         led_(led),
         button_(button),
@@ -162,6 +157,21 @@ class MqttLink {
       showStartupInfo(bleName_, bleAddress_);
       return;
     }
+    if (petRequested_) {
+      // Same deferral as replayRequested_ above - see onButtonLongPress().
+      petRequested_ = false;
+      playPetReaction();
+      return;
+    }
+    if (statusRequested_) {
+      // Same deferral as configInfoRequested_ above - see
+      // onButtonDoubleClick(). Reuses the same screen configInfoRequested_
+      // shows; the two flags exist separately only because they're set from
+      // different button gestures with different idle-state guards.
+      statusRequested_ = false;
+      showStartupInfo(bleName_, bleAddress_);
+      return;
+    }
     PendingMessage msg;
     size_t remaining;
     if (!popQueued(&msg, &remaining)) return;
@@ -200,6 +210,35 @@ class MqttLink {
     holdMs_ = holdMs;
     keepLastMessage_ = keepLastMessage;
   }
+
+  // Updates the panels' brightness and overnight schedule - brightnessPercent
+  // (0-100) is applied to both OLEDs immediately via applyBrightness();
+  // offStartMinutes/offEndMinutes (each minutes-since-midnight, local time)
+  // replace the window isScreenOffTime() checks, wrapping across midnight
+  // when offStartMinutes > offEndMinutes the same way a plain "22:00-07:00"
+  // reads; equal values disable the schedule (screens never power off on
+  // their own). wakeForMessage controls whether an incoming message wakes
+  // sleeping panels (see wakeForMessage() below) or is drawn silently into
+  // GDDRAM for the panels to show whenever they next wake on their own.
+  // Called from appTask at startup and again from BleConfigService's
+  // onConfig callback, same as setDisplayOptions() above.
+  void setScreenOptions(uint8_t brightnessPercent, uint16_t offStartMinutes,
+                        uint16_t offEndMinutes, bool wakeForMessage) {
+    brightnessPercent_ = brightnessPercent;
+    screenOffStartMin_ = offStartMinutes;
+    screenOffEndMin_ = offEndMinutes;
+    wakeForMessageEnabled_ = wakeForMessage;
+    applyBrightness();
+  }
+
+  // Records the user's configured message text size (SpeechBubble::
+  // setTextSize() - 1 Small, 2 Large) so showStartupInfo() can force its own
+  // dense status line back down to Small and then restore this afterward.
+  // Called from the same two appTask spots that already push
+  // settings.messageTextSize straight to the bubble - see there. Doesn't
+  // touch the bubble itself: a real message's size is still applied by
+  // those callers, this is only read back by showStartupInfo().
+  void setMessageTextSize(uint8_t size) { messageTextSize_ = size; }
 
   // True once display() has left a message up under keepLastMessage_ instead
   // of reverting to the idle clock. main.cpp's loop must skip idleClock->tick()
@@ -266,6 +305,32 @@ class MqttLink {
     }
   }
 
+  // Wired up as the push button's double-click handler (see main.cpp) - the
+  // "what am I connected to" status screen (showStartupInfo()) on demand,
+  // any time the device is idle, not just before the first message has ever
+  // arrived (that's still the single-click idle behavior above). Ignored
+  // while a message is active - same "don't interrupt what's on screen"
+  // rule onButtonClick() follows for the dismiss/replay case - and deferred
+  // to loop() via statusRequested_ for the same reentrancy reason (see the
+  // correction in onButtonClick()'s header comment: calling straight into a
+  // blocking bubble_->show() from inside this callback re-enters
+  // OneButton::tick() and misfires).
+  void onButtonDoubleClick() {
+    if (messageActive_) return;
+    statusRequested_ = true;
+  }
+
+  // Wired up as the push button's long-press handler (see main.cpp) - a
+  // wordless "pet" gesture: a fresh random portrait, a soft jingle and a
+  // brief warm LED glow (see playPetReaction()). Purely a toy flourish, so
+  // it's ignored while a message is active rather than competing with it -
+  // same guard as onButtonDoubleClick() above - and deferred to loop() via
+  // petRequested_ for the same reentrancy reason.
+  void onButtonLongPress() {
+    if (messageActive_) return;
+    petRequested_ = true;
+  }
+
   // "What am I connected to" summary - reports the broker, link state,
   // network identity and BLE identity so a glance at the bubble answers that
   // without needing a laptop. Always holds for a fixed 10s regardless of
@@ -292,6 +357,12 @@ class MqttLink {
                   (mqtt_.connected() ? "online" : "offline") + " | " +
                   deviceName_ + " " + WiFi.localIP().toString() + " | BLE " +
                   bleName + " " + bleAddress;
+    // This packs far more into one screen than a real message ever does, so
+    // it's always shown Small regardless of the user's configured message
+    // size (messageTextSize_) - at Large it wraps into more lines than the
+    // panel can hold before it even reaches the BLE identity. Restored to
+    // the configured size below so the next real message isn't left small.
+    bubble_->setTextSize(1);
     // button_->tick() pumped through both blocking calls below, same as
     // display() does for a real message - without it OneButton misses
     // however many polls this 10s+ round trip skips, which can desync its
@@ -306,6 +377,7 @@ class MqttLink {
       if (button_ != nullptr) button_->tick();
       return false;
     });
+    bubble_->setTextSize(messageTextSize_);
     if (clock_ != nullptr) clock_->showNow();
   }
 
@@ -327,6 +399,10 @@ class MqttLink {
   // Silence held after a jingle finishes and before typing's own beeps
   // start - see display()'s use of this below.
   static constexpr uint32_t kPostJingleGapMs = 300;
+  // How long playPetReaction() holds its LED glow before switching it off -
+  // long enough to register as a deliberate flourish, short enough that a
+  // repeated long-press doesn't feel laggy.
+  static constexpr uint32_t kPetLedHoldMs = 600;
   // How often lipSyncTask advances the announcer to its next frame while a
   // message is typing - a steady talking pace rather than the old random
   // 60-140ms jitter, since real per-character frames (a blink, a mouth
@@ -371,7 +447,6 @@ class MqttLink {
   // while a previous message is still typing/holding on the bubble panel.
   struct PendingMessage {
     String text;
-    String exprName;
     LedSpec ledSpec;
     bool ledBlink = false;
     JingleTune jingle = JingleTune::None;
@@ -403,10 +478,9 @@ class MqttLink {
   //   "#RRGGBB" - any color, with or without the leading '#'
   //   "red"/"green"/"blue" - aliases for the full-scale primaries, kept so the
   //               control page and older publishers keep working unchanged
-  // Anything else logs a warning and leaves the LED off for this message - the
-  // same "unrecognized falls back rather than fails" treatment as an
-  // unrecognized expression. Matching is case-insensitive, same as the
-  // expression match in display().
+  // Anything else logs a warning and leaves the LED off for this message -
+  // the same "unrecognized falls back rather than fails" treatment as the
+  // jingle field below. Matching is case-insensitive.
   //
   // Only the exact 6-digit hex form is accepted: a short "#fff" or a stray
   // trailing character is a typo worth warning about rather than something to
@@ -441,9 +515,9 @@ class MqttLink {
   // (six as of "beep", 2026-09-19 - this comment previously said "four" and
   // was already stale by one at "boarding"; corrected while touching this
   // line rather than left for the next miscount), matched case-insensitively
-  // for the same reason "led" and "expression" are (contract v2,
-  // 2026-09-17) - being the one field that still cared about case would be a
-  // trap, not a convention. Anything else logs a warning and plays nothing
+  // for the same reason "led" is (contract v2, 2026-09-17) - being the one
+  // field that still cared about case would be a trap, not a convention.
+  // Anything else logs a warning and plays nothing
   // for this message, same "unrecognized falls back rather than fails"
   // treatment as the other two.
   static JingleTune jingleFromString(const String &name) {
@@ -454,6 +528,11 @@ class MqttLink {
     if (strcasecmp(name.c_str(), "gentle") == 0) return JingleTune::Gentle;
     if (strcasecmp(name.c_str(), "boarding") == 0) return JingleTune::Boarding;
     if (strcasecmp(name.c_str(), "beep") == 0) return JingleTune::Beep;
+    if (strcasecmp(name.c_str(), "coin") == 0) return JingleTune::Coin;
+    if (strcasecmp(name.c_str(), "oneup") == 0) return JingleTune::OneUp;
+    if (strcasecmp(name.c_str(), "stageclear") == 0) return JingleTune::StageClear;
+    if (strcasecmp(name.c_str(), "descend") == 0) return JingleTune::Descend;
+    if (strcasecmp(name.c_str(), "trill") == 0) return JingleTune::Trill;
     Serial.printf("MQTT: unrecognized jingle '%s', playing nothing\n",
                   name.c_str());
     return JingleTune::None;
@@ -469,7 +548,6 @@ class MqttLink {
       return false;
     }
     out->text = doc["text"] | "";
-    out->exprName = doc["expression"] | "";
     out->ledSpec = ledSpecFromString(doc["led"] | "");
     out->ledBlink = doc["blink"] | false;
     out->jingle = jingleFromString(doc["jingle"] | "");
@@ -548,31 +626,13 @@ class MqttLink {
   // drawn as a row of dots in the bubble panel's bottom-left corner so a
   // message flood is visible as "more coming" rather than silently queued.
   void display(const PendingMessage &msg, size_t remainingQueued) {
-    // "expression" no longer drives anything on the face - see the
-    // constructor comment above for why. This loop only still exists to
-    // keep warning on a value nobody recognizes, same as it always has.
-    bool matched = false;
-    for (size_t i = 0; i < count_; i++) {
-      // Case-insensitive: lowercase ("happy") is the canonical spelling the
-      // API and docs use, but kExpressionNames[] is capitalized and older
-      // publishers send it that way, so both must match.
-      if (strcasecmp(names_[i], msg.exprName.c_str()) == 0) {
-        matched = true;
-        break;
-      }
-    }
-    if (!matched) {
-      Serial.printf("MQTT: unrecognized expression '%s', ignored\n",
-                    msg.exprName.c_str());
-    }
-
     // A new message is about to take over the panel, so any previously held
     // message is no longer what's on screen - reset before the keepLastMessage_
     // branch below decides whether this one ends up held too.
     messageHeld_ = false;
     if (bubble_ != nullptr && msg.text.length() > 0) {
       // Remembered so onButtonClick() can replay this exact message (text +
-      // expression + LED) once nothing is on screen - see there.
+      // LED) once nothing is on screen - see there.
       lastMessage_ = msg;
       haveLastMessage_ = true;
       // "On screen" from here until revertToIdle() below - covers typing,
@@ -681,6 +741,32 @@ class MqttLink {
     resleepIfNight();
   }
 
+  // The long-press "pet" reaction (see onButtonLongPress()) - a fresh random
+  // portrait, the same jingle a gentle/ambient message would use, and a
+  // brief warm-pink LED glow. No bubble text: this is a wordless flourish,
+  // not a message, so it doesn't touch lastMessage_/haveLastMessage_ or
+  // anything display() tracks. Blocking is fine here - the jingle plus the
+  // LED hold below is well under a second, same tolerance loop()'s other
+  // deferred branches already have.
+  void playPetReaction() {
+    if (portraitFace_ != nullptr) portraitFace_->pickRandom();
+    if (jingle_ != nullptr) jingle_->play(JingleTune::Gentle);
+    if (led_ != nullptr) {
+      LedSpec spec;
+      spec.mode = LedSpec::Mode::Solid;
+      // Warm pink - deliberately not a color any message payload sends
+      // (LedSpec's "led" field takes arbitrary hex, but triage.ts's actual
+      // palette runs status colors, not this), so a glance tells "petted"
+      // apart from "a message is showing".
+      spec.r = 255;
+      spec.g = 105;
+      spec.b = 180;
+      led_->start(spec, /*blink=*/false);
+      vTaskDelay(pdMS_TO_TICKS(kPetLedHoldMs));
+      led_->stop();
+    }
+  }
+
   // True between 23:00 and 07:00 local time - the window the resting face
   // should look asleep rather than its usual awake sway. Unsynced time (see
   // digital_clock.h's own 1970 check) reads as false: a device that hasn't
@@ -712,19 +798,30 @@ class MqttLink {
     if (portraitFace_ != nullptr) portraitFace_->setSleeping(night);
   }
 
-  // True from midnight up to (not including) 07:00 local time - the window
-  // both OLED panels should be powered off in, rather than just showing an
-  // unread idle clock/Sleepy face all night. Deliberately starts at midnight
-  // rather than isNighttime()'s 23:00: that earlier boundary is only about
-  // the resting face's expression, not the panels' power state, and the two
-  // don't have to (and here don't) share a threshold. Same unsynced-time
-  // guard as isNighttime(), and for the same reason.
+  // True while local time falls inside [screenOffStartMin_, screenOffEndMin_)
+  // (minutes since midnight) - the window both OLED panels should be powered
+  // off in, rather than just showing an unread idle clock/Sleepy face all
+  // night. Defaults to midnight-07:00 (see the member initializers below),
+  // matching this method's old hardcoded "hour < 7" behavior, but is now
+  // configurable via setScreenOptions() - see device_settings.h's
+  // screenOffStart/screenOffEnd. Deliberately independent of isNighttime()'s
+  // fixed 23:00 threshold: that one is only about the resting face's
+  // expression, not the panels' power state, and the two don't have to (and
+  // don't by default) share a boundary. Wraps across midnight when start >
+  // end (e.g. 22:00-07:00); start == end disables the schedule entirely, so
+  // the panels never power off on their own. Same unsynced-time guard as
+  // isNighttime(), and for the same reason.
   bool isScreenOffTime() const {
+    if (screenOffStartMin_ == screenOffEndMin_) return false;
     time_t now = time(nullptr);
     struct tm local;
     if (localtime_r(&now, &local) == nullptr || local.tm_year < (2024 - 1900))
       return false;
-    return local.tm_hour < 7;
+    uint16_t nowMin = static_cast<uint16_t>(local.tm_hour * 60 + local.tm_min);
+    if (screenOffStartMin_ < screenOffEndMin_) {
+      return nowMin >= screenOffStartMin_ && nowMin < screenOffEndMin_;
+    }
+    return nowMin >= screenOffStartMin_ || nowMin < screenOffEndMin_;
   }
 
   // Sends the SSD1306 sleep/wake command to both panels on an actual
@@ -758,10 +855,29 @@ class MqttLink {
   // that flag tracks what the *resting* state should be, which hasn't
   // changed just because one message is being shown on top of it - see
   // resleepIfNight(), which reads it back once the message is done.
+  //
+  // Gated on wakeForMessageEnabled_ (see setScreenOptions()) - when the user
+  // has turned that off, a message during the screen-off window is still
+  // typed and held as normal, just onto panels that stay powered down; it
+  // shows once they next wake on their own (schedule end, or a button
+  // press), same as anything else that was drawn while asleep.
   void wakeForMessage() {
-    if (!screensAsleep_) return;
+    if (!screensAsleep_ || !wakeForMessageEnabled_) return;
     if (faceDisplay_ != nullptr) faceDisplay_->wakeup();
     if (textDisplay_ != nullptr) textDisplay_->wakeup();
+  }
+
+  // Maps brightnessPercent_ (0-100) onto the SSD1306 contrast register's
+  // 0-255 range and applies it to both panels - called from
+  // setScreenOptions() whenever the setting changes. Doesn't interact with
+  // portrait_face.h's pickRandom() cross-fade: that reads back whatever
+  // level is current via getBrightness() as its "resting" brightness before
+  // fading, so it always fades to/from whatever this last set.
+  void applyBrightness() {
+    uint8_t level = static_cast<uint8_t>(
+        (static_cast<uint16_t>(brightnessPercent_) * 255 + 50) / 100);
+    if (faceDisplay_ != nullptr) faceDisplay_->setBrightness(level);
+    if (textDisplay_ != nullptr) textDisplay_->setBrightness(level);
   }
 
   // Undoes wakeForMessage() once a message finishes - called from
@@ -804,6 +920,9 @@ class MqttLink {
   // Set by setDisplayOptions(), read by display() - see there for behavior.
   uint32_t holdMs_ = kDefaultMessageHoldMs;
   bool keepLastMessage_ = false;
+  // Set by setMessageTextSize(), read by showStartupInfo() to restore the
+  // bubble's size after forcing it to Small - see both.
+  uint8_t messageTextSize_ = 1;
   // Set by display() when keepLastMessage_ leaves a message up instead of
   // reverting to the idle clock; read by isHoldingMessage(). See there.
   bool messageHeld_ = false;
@@ -825,12 +944,21 @@ class MqttLink {
   // distinguish from day - defaulting to false (awake) just means boot
   // doesn't send a redundant wakeup() to panels that are already on.
   bool screensAsleep_ = false;
+  // Set by setScreenOptions(), read by applyBrightness()/isScreenOffTime()/
+  // wakeForMessage(). Defaults reproduce this class's old hardcoded
+  // behavior (full brightness, midnight-07:00 screen-off, always wake for a
+  // message) for the brief window before main.cpp's first real call - see
+  // setScreenOptions()'s comment.
+  uint8_t brightnessPercent_ = 100;
+  uint16_t screenOffStartMin_ = 0;
+  uint16_t screenOffEndMin_ = 7 * 60;
+  bool wakeForMessageEnabled_ = true;
   // Set by onButtonClick() while display() is blocked inside show()/
   // holdWithCountdown(); polled by the lambdas passed to those calls (see
   // display()) so a click can cut a message short instead of waiting for it
   // to finish on its own.
   volatile bool dismissRequested_ = false;
-  // The last message actually shown (text/expression/LED), so onButtonClick()
+  // The last message actually shown (text/LED), so onButtonClick()
   // can redisplay it when nothing is currently on screen. Only ever set from
   // display(), on appTask's own thread - see onButtonClick().
   PendingMessage lastMessage_;
@@ -846,8 +974,15 @@ class MqttLink {
   // been shown (haveLastMessage_ false); consumed by loop() the same way
   // replayRequested_ is, for the same re-entrancy reason - see there.
   volatile bool configInfoRequested_ = false;
+  // Set by onButtonLongPress() when idle; consumed by loop() the same way
+  // replayRequested_ is, for the same re-entrancy reason - see there and
+  // playPetReaction().
+  volatile bool petRequested_ = false;
+  // Set by onButtonDoubleClick() when idle; consumed by loop() the same way
+  // configInfoRequested_ is, for the same re-entrancy reason - see there.
+  volatile bool statusRequested_ = false;
   // Captured once via setBleIdentity(), read by showStartupInfo() when
-  // configInfoRequested_ fires - see both.
+  // configInfoRequested_/statusRequested_ fires - see both.
   String bleName_;
   String bleAddress_;
 
@@ -863,8 +998,6 @@ class MqttLink {
 
   PortraitFace *portraitFace_;
   SpeechBubble *bubble_;
-  const char *const *names_;
-  size_t count_;
   DigitalClock *clock_;
   RgbLed *led_;
   OneButton *button_;

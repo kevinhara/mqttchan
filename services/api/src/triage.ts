@@ -2,24 +2,22 @@
  * The single place presentation is decided: semantic (kind, priority) in,
  * device fields out.
  *
- * Feeds never pick an expression or a color. That is what lets the device
- * contract change - as it did for contract v2 - without touching a feed, and
- * what keeps the device's voice consistent across sources instead of each feed
- * inventing its own.
+ * Feeds never pick a color or a jingle. That is what lets the device
+ * contract change - as it did for contract v2, and again for v3's removal of
+ * `expression` - without touching a feed, and what keeps the device's voice
+ * consistent across sources instead of each feed inventing its own.
  */
 
 import type { Priority } from "@mqttchan/contract";
-import type { Expression, Jingle, Led } from "./device.js";
+import type { Jingle, Led } from "./device.js";
 
 export interface Presentation {
-  expression: Expression;
   led: Led;
   blink: boolean;
   jingle: "" | Jingle;
 }
 
 const QUIET: Presentation = {
-  expression: "neutral",
   led: "",
   blink: false,
   jingle: "",
@@ -41,7 +39,6 @@ const BY_KIND: Record<string, Presentation> = {
    * reads as "routine, nothing to act on" at a glance.
    */
   "sensor.reading": {
-    expression: "neutral",
     led: "#00ff00",
     blink: false,
     jingle: "beep",
@@ -53,21 +50,18 @@ const BY_KIND: Record<string, Presentation> = {
    * aircraft movement, not yet re-tuned for any other `notice` producer.
    */
   notice: {
-    expression: "happy",
     led: "#3399ff",
     blink: false,
     jingle: "boarding",
   },
   /** Something wrong. The only kind that blinks. */
   alert: {
-    expression: "doubt",
     led: "#ff0000",
     blink: true,
     jingle: "alert",
   },
   /** Good news. */
   celebrate: {
-    expression: "happy",
     led: "cycle",
     blink: false,
     jingle: "fanfare",

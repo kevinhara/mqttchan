@@ -232,25 +232,19 @@ static DeviceSettings settings;
 // SpeechBubble::show()'s per-character reveal loop without slowing it down.
 static void beepChar() { tone(PIEZO_PIN, 1800, 15); }
 
-// Contract v2's "expression" vocabulary - kept only so MqttLink can keep
-// validating/warning on an unrecognized value, same as always. Used to also
-// select an m5avatar::Expression for the face; PortraitFace has no such
-// per-mood variants, so nothing consumes the matched value anymore - see
-// the constructor comment in mqtt_link.h.
-static const char *const kExpressionNames[] = {"Happy",  "Angry",  "Sad",
-                                               "Doubt",  "Sleepy", "Neutral"};
-static constexpr size_t kExpressionCount =
-    sizeof(kExpressionNames) / sizeof(kExpressionNames[0]);
-
 #ifdef AVATAR_DEMO_MODE
-// One line per expression above, in the same order — what the bubble shows
-// while that expression is active. Placeholder for real TTS text; nihilistic
-// one-liners for now because a demo bubble should at least be funny. Only
-// used by the self-cycling demo loop below — real messages come from MQTT.
+// Placeholder for real TTS text; nihilistic one-liners for now because a
+// demo bubble should at least be funny. Only used by the self-cycling demo
+// loop below — real messages come from MQTT. Used to be one line per
+// contract v2 "expression" value (removed 2026-09-19 - see mqtt_link.h's
+// constructor comment), but the phrases never depended on that mapping for
+// anything besides array length, so they just cycle on their own count now.
 static const char *const kPhrases[] = {
     "Smile. The void won't notice.", "Scream away. Nothing's listening.",
     "Cheer up - nothing matters.",    "No one's driving. Never was.",
     "Rest easy. Heat death can wait.", "Just meat, doing meat things."};
+static constexpr size_t kPhraseCount =
+    sizeof(kPhrases) / sizeof(kPhrases[0]);
 
 // Cycles the announcer through its own frame set for `ms` - the same thing
 // mqtt_link.h's lipSyncTask does for a real message, but driven by hand
@@ -330,17 +324,20 @@ static void demoLoop() {
     // MqttLink::revertToIdle() makes after a real announcement.
     if (portraitFace != nullptr) portraitFace->pickRandom();
     if (bubble != nullptr) {
-      bubble->show(kPhrases[i % kExpressionCount]);
+      bubble->show(kPhrases[i % kPhraseCount]);
     }
 
-    Serial.printf("[core %d] phrase=%-8s heap=%6u draw=core %d\n",
-                  xPortGetCoreID(), kExpressionNames[i % kExpressionCount],
-                  (unsigned)ESP.getFreeHeap(), APP_CPU_NUM);
+    char label[16];
+    snprintf(label, sizeof(label), "phrase %u",
+             (unsigned)(i % kPhraseCount));
+
+    Serial.printf("[core %d] %-10s heap=%6u draw=core %d\n", xPortGetCoreID(),
+                  label, (unsigned)ESP.getFreeHeap(), APP_CPU_NUM);
 
 #ifdef AVATAR_FB_DUMP
     delay(400);
-    dumpFramebuffer(kExpressionNames[i % kExpressionCount]);
-    dumpBubbleFramebuffer(kExpressionNames[i % kExpressionCount]);
+    dumpFramebuffer(label);
+    dumpBubbleFramebuffer(label);
 #endif
 
     // Every third phrase, babble for a bit so the portrait's own frames
@@ -376,8 +373,7 @@ static void appTask(void *) {
   static OneButton button(BUTTON_PIN, /*activeLow=*/true,
                            /*pullupActive=*/true);
 
-  static MqttLink mqttLink(portraitFace, bubble, kExpressionNames,
-                            kExpressionCount, idleClock, &rgbLed, &button,
+  static MqttLink mqttLink(portraitFace, bubble, idleClock, &rgbLed, &button,
                             &jingle, &oled, &oledText);
   // Plays once, right as appTask starts up, before the bubble panel shows
   // anything - see jingle.h's playStartup() for why this is its own tune
@@ -390,8 +386,8 @@ static void appTask(void *) {
   vTaskDelay(pdMS_TO_TICKS(1000));
   // Bubble panel's own boot sequence: "Connecting to <ssid>" while
   // connectWiFi() (inside begin() below) does its blocking wait, then
-  // "Fetching data" once that attempt has settled and MQTT/SNTP take over -
-  // digital_clock.h's draw() picks up that same "Fetching data" text once
+  // "Fetching" once that attempt has settled and MQTT/SNTP take over -
+  // digital_clock.h's draw() picks up that same "Fetching" text once
   // idleClock starts ticking below, so the panel never goes blank for the
   // rest of the unsynced wait. Both are typed fast (20ms/char, vs. a real
   // message's 45ms) since these are status text, not something to savor.
@@ -403,14 +399,17 @@ static void appTask(void *) {
   mqttLink.setDeviceName(settings.name);
   mqttLink.begin(settings.ssid, settings.pass, settings.host, settings.port,
                  settings.topic);
-  if (bubble != nullptr) bubble->show("Fetching data", /*charDelayMs=*/20);
+  if (bubble != nullptr) bubble->show("Fetching", /*charDelayMs=*/20);
   mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
                               settings.keepLastMessage);
+  mqttLink.setMessageTextSize(settings.messageTextSize);
+  mqttLink.setScreenOptions(settings.screenBrightness, settings.screenOffStart,
+                             settings.screenOffEnd, settings.wakeForMessage);
   if (idleClock != nullptr) idleClock->setTimezone(settings.tz);
 
   // BLE config: a phone (nRF Connect, LightBlue, ...) can connect, read/write
   // WiFi+MQTT+display settings, and push a one-off test message through the
-  // same {"text":...,"expression":...} JSON path MQTT uses — see
+  // same {"text":...,"led":...} JSON path MQTT uses — see
   // ble_config.h. Started ahead of mqttLink.setBleIdentity() below so that
   // call can capture the BLE identity NimBLEDevice::init() assigns, alongside
   // the WiFi one, instead of just the MQTT one.
@@ -458,6 +457,10 @@ static void appTask(void *) {
         doc["holdSeconds"] = settings.messageHoldSeconds;
         doc["keepLast"] = settings.keepLastMessage;
         doc["textSize"] = settings.messageTextSize;
+        doc["brightness"] = settings.screenBrightness;
+        doc["screenOffStart"] = settings.screenOffStart;
+        doc["screenOffEnd"] = settings.screenOffEnd;
+        doc["wakeForMessage"] = settings.wakeForMessage;
       });
 
   // Records the BLE identity for the "what am I connected to" summary
@@ -471,20 +474,21 @@ static void appTask(void *) {
   // Multifunction button (see BUTTON_PIN above, and `button`'s declaration
   // near the top of this function). A single click dismisses whatever
   // message is on screen, or replays the last one if nothing is - see
-  // MqttLink::onButtonClick(). Double-click/long-press have no action wired
-  // up yet, so those two just log for now, to confirm timing over serial
-  // before deciding what they should do.
+  // MqttLink::onButtonClick(). A double-click shows the "what am I
+  // connected to" status screen on demand (MqttLink::onButtonDoubleClick()).
+  // A long-press is a wordless "pet" gesture - new portrait, soft jingle,
+  // warm LED glow (MqttLink::onButtonLongPress()). Both of the latter two
+  // are no-ops while a message is on screen - see their comments in
+  // mqtt_link.h for why.
   button.attachClick([]() { mqttLink.onButtonClick(); });
-  button.attachDoubleClick([]() { Serial.println("Button: double-click"); });
-  button.attachLongPressStart(
-      []() { Serial.println("Button: long-press start"); });
+  button.attachDoubleClick([]() { mqttLink.onButtonDoubleClick(); });
+  button.attachLongPressStart([]() { mqttLink.onButtonLongPress(); });
 
 #ifdef AVATAR_FB_DUMP
   // Headless bench test: exercise the parse-and-display path with a
   // synthetic payload, no live broker required — same "read back what was
   // actually rasterised" technique as dumpFramebuffer/dumpBubbleFramebuffer.
-  mqttLink.injectForTest(
-      "{\"text\":\"Bench test, no broker needed.\",\"expression\":\"Happy\"}");
+  mqttLink.injectForTest("{\"text\":\"Bench test, no broker needed.\"}");
   dumpFramebuffer("MQTT bench test");
   dumpBubbleFramebuffer("MQTT bench test");
 #endif
@@ -509,6 +513,11 @@ static void appTask(void *) {
                             settings.port, settings.topic);
       mqttLink.setDisplayOptions(settings.messageHoldSeconds * 1000UL,
                                   settings.keepLastMessage);
+      mqttLink.setMessageTextSize(settings.messageTextSize);
+      mqttLink.setScreenOptions(settings.screenBrightness,
+                                 settings.screenOffStart,
+                                 settings.screenOffEnd,
+                                 settings.wakeForMessage);
       if (bubble != nullptr) bubble->setTextSize(settings.messageTextSize);
       if (idleClock != nullptr) idleClock->setTimezone(settings.tz);
     }
@@ -599,7 +608,11 @@ void setup() {
                 MQTT_PORT, MQTT_TOPIC, DigitalClock::kDefaultTz,
                 /*defaultMessageHoldSeconds=*/30,
                 /*defaultKeepLastMessage=*/false,
-                /*defaultMessageTextSize=*/1);
+                /*defaultMessageTextSize=*/1,
+                /*defaultScreenBrightness=*/100,
+                /*defaultScreenOffStart=*/0,      // 00:00
+                /*defaultScreenOffEnd=*/7 * 60,    // 07:00
+                /*defaultWakeForMessage=*/true);
 
   // HLI boot POST + splash intro, played once before M5Unified/LGFX claims
   // either panel — POST (scrolling console text) first, alone, then splash

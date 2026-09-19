@@ -20,12 +20,20 @@ struct DeviceSettings {
   bool keepLastMessage;         // see MqttLink::setDisplayOptions()
   uint8_t messageTextSize;      // see SpeechBubble::setTextSize() - 1 (Small,
                                  // the original/default GLCD size) or 2 (Large)
+  uint8_t screenBrightness;     // 0-100 (%) - see MqttLink::setScreenOptions()
+  uint16_t screenOffStart;      // minutes since midnight, local time - see
+                                 // MqttLink::isScreenOffTime()
+  uint16_t screenOffEnd;        // ditto; equal to screenOffStart disables the
+                                 // schedule entirely (screens never power off)
+  bool wakeForMessage;          // see MqttLink::wakeForMessage()
 
   void load(const char *defaultName, const char *defaultSsid,
             const char *defaultPass, const char *defaultHost,
             uint16_t defaultPort, const char *defaultTopic,
             const char *defaultTz, uint16_t defaultMessageHoldSeconds,
-            bool defaultKeepLastMessage, uint8_t defaultMessageTextSize) {
+            bool defaultKeepLastMessage, uint8_t defaultMessageTextSize,
+            uint8_t defaultScreenBrightness, uint16_t defaultScreenOffStart,
+            uint16_t defaultScreenOffEnd, bool defaultWakeForMessage) {
     Preferences prefs;
     prefs.begin(kNamespace, /*readOnly=*/true);
     name = prefs.getString("name", defaultName);
@@ -39,6 +47,11 @@ struct DeviceSettings {
         prefs.getUShort("holdSeconds", defaultMessageHoldSeconds);
     keepLastMessage = prefs.getBool("keepLast", defaultKeepLastMessage);
     messageTextSize = prefs.getUChar("textSize", defaultMessageTextSize);
+    screenBrightness =
+        prefs.getUChar("brightness", defaultScreenBrightness);
+    screenOffStart = prefs.getUShort("offStart", defaultScreenOffStart);
+    screenOffEnd = prefs.getUShort("offEnd", defaultScreenOffEnd);
+    wakeForMessage = prefs.getBool("wakeForMsg", defaultWakeForMessage);
     prefs.end();
   }
 
@@ -87,6 +100,22 @@ struct DeviceSettings {
     if (doc["textSize"].is<uint8_t>()) {
       messageTextSize = doc["textSize"].as<uint8_t>();
       prefs.putUChar("textSize", messageTextSize);
+    }
+    if (doc["brightness"].is<uint8_t>()) {
+      screenBrightness = doc["brightness"].as<uint8_t>();
+      prefs.putUChar("brightness", screenBrightness);
+    }
+    if (doc["screenOffStart"].is<uint16_t>()) {
+      screenOffStart = doc["screenOffStart"].as<uint16_t>();
+      prefs.putUShort("offStart", screenOffStart);
+    }
+    if (doc["screenOffEnd"].is<uint16_t>()) {
+      screenOffEnd = doc["screenOffEnd"].as<uint16_t>();
+      prefs.putUShort("offEnd", screenOffEnd);
+    }
+    if (doc["wakeForMessage"].is<bool>()) {
+      wakeForMessage = doc["wakeForMessage"].as<bool>();
+      prefs.putBool("wakeForMsg", wakeForMessage);
     }
     prefs.end();
   }

@@ -1,9 +1,12 @@
 /**
  * The MQTT payload contract, and the only module that knows it.
  *
- * Contract v2 (2026-09-17), matching firmware/include/mqtt_link.h:
- *   - `expression` is matched case-insensitively by the firmware, so lowercase
- *     is the canonical spelling everything here emits.
+ * Contract v3 (2026-09-19), matching firmware/include/mqtt_link.h:
+ *   - `expression` is gone. Contract v2's six-word mood vocabulary
+ *     (happy/angry/sad/doubt/sleepy/neutral) stopped driving anything the
+ *     moment the firmware's portrait pack replaced m5avatar's procedural
+ *     eyes/mouth - it had been a parse-and-warn-only no-op field since. See
+ *     the firmware's mqtt_link.h constructor comment.
  *   - `led` accepts "#rrggbb" hex, "cycle", or the legacy "red"/"green"/"blue"
  *     aliases. We always emit hex or "cycle" - never the aliases.
  *   - `text` may be long: SpeechBubble scrolls rather than clipping. Length is
@@ -11,17 +14,19 @@
  *     hard limit is the encoded payload size.
  */
 
-export const EXPRESSIONS = [
-  "happy",
-  "angry",
-  "sad",
-  "doubt",
-  "sleepy",
-  "neutral",
+export const JINGLES = [
+  "chime",
+  "alert",
+  "fanfare",
+  "gentle",
+  "boarding",
+  "beep",
+  "coin",
+  "oneup",
+  "stageclear",
+  "descend",
+  "trill",
 ] as const;
-export type Expression = (typeof EXPRESSIONS)[number];
-
-export const JINGLES = ["chime", "alert", "fanfare", "gentle", "boarding", "beep"] as const;
 export type Jingle = (typeof JINGLES)[number];
 
 /** "" = no LED, "cycle" = HSV sweep, otherwise "#rrggbb". */
@@ -29,7 +34,6 @@ export type Led = "" | "cycle" | `#${string}`;
 
 export interface DevicePayload {
   text: string;
-  expression: Expression;
   led: Led;
   blink: boolean;
   jingle: "" | Jingle;
@@ -53,8 +57,8 @@ export class PayloadError extends Error {}
  *
  * Empty text is refused rather than sent: the firmware gates the entire
  * message body on `text.length() > 0`, so an empty-text payload silently does
- * nothing at all - no expression change, no LED, no jingle. Better to fail
- * loudly here than to publish a no-op.
+ * nothing at all - no LED, no jingle. Better to fail loudly here than to
+ * publish a no-op.
  *
  * Over-budget payloads have their *text* trimmed at a word boundary until they
  * fit, rather than being rejected: the device drops oversized payloads with no
@@ -67,9 +71,6 @@ export function finalisePayload(
   const text = payload.text.trim();
   if (text.length === 0) {
     throw new PayloadError("text is empty; the device would ignore the message");
-  }
-  if (!EXPRESSIONS.includes(payload.expression)) {
-    throw new PayloadError(`invalid expression ${JSON.stringify(payload.expression)}`);
   }
   if (!isValidLed(payload.led)) {
     throw new PayloadError(`invalid led ${JSON.stringify(payload.led)}`);

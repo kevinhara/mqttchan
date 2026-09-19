@@ -10,14 +10,15 @@ api                 triage, rate limiting, and the MQTT connection
 feeds/example       a template feed, not a real integration
 feeds/flights       arrivals and departures at ZQN, from live ADS-B
 feeds/ha-temperature  room temperatures from Home Assistant, Zigbee sensors only
+feeds/sky           sun/moon/planet digest, aurora Kp alert, MetService warnings
 ```
 
 ## The idea
 
 A feed says *what happened*. The API decides *how it looks* and *when it shows*.
 
-A feed never picks an expression, a color or a jingle, and never opens an MQTT
-connection. It sends:
+A feed never picks a color or a jingle, and never opens an MQTT connection.
+It sends:
 
 ```json
 { "source": "ha-temperature", "kind": "sensor.reading",
@@ -33,8 +34,8 @@ know.
 
 1. **Rate limit per source** — a token bucket, so one noisy feed cannot
    monopolise the device.
-2. **Triage** (`src/triage.ts`) — `kind` + `priority` decide expression, LED
-   color, blink and jingle. This is the one place presentation is decided, which
+2. **Triage** (`src/triage.ts`) — `kind` + `priority` decide LED color,
+   blink and jingle. This is the one place presentation is decided, which
    is what keeps the device's voice consistent and lets the MQTT contract change
    without touching a feed.
 3. **Dedupe** — a newer message with the same `dedupeKey` *replaces* the queued
@@ -130,6 +131,16 @@ Verified against live HA on 2026-09-17, so it doesn't need rediscovering:
 The long-lived token goes in `.env` on osmo. The one still sitting in the old
 `avatar-brain/.env` returns 401, which is why that service never published
 anything.
+
+## The Queenstown sky feed
+
+`feeds/sky` announces a once-daily sun/moon/planet-and-weather digest, an
+edge-triggered aurora alert from NOAA's planetary Kp index, and MetService
+severe weather watches/warnings for Queenstown - see
+[`feeds/sky/README.md`](feeds/sky/README.md). Only the weather outlook needs
+an API key (`METSERVICE_API_KEY`, MetService's Point Forecast API); confirmed
+live 2026-09-19 for Queenstown's coordinates. Everything else in the feed
+needs none.
 
 **Resolved 2026-09-18:** this research didn't establish which HA integration
 those Zigbee sensors run on (ZHA, Zigbee2MQTT, deCONZ). `HA_ZIGBEE_INTEGRATION`

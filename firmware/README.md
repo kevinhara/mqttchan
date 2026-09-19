@@ -48,10 +48,11 @@ believable because it was true from this project's start through
 document (core split, MQTT contract, expressions, demo mode) was written
 against the old library and has not been fully re-verified against the new
 one; `include/portrait_face.h`, `include/mqtt_link.h` and `src/main.cpp` are
-the current source of truth where the two disagree. Notably, "expression" in
-the MQTT payload is still parsed and validated the same as before, but no
-longer selects anything on the face - see the constructor comment in
-`mqtt_link.h`.
+the current source of truth where the two disagree. **Update, 2026-09-19:**
+"expression" no longer appears in the MQTT payload at all - contract v3
+removed the field entirely (it had been parsed-and-warned-on but otherwise
+inert since the portrait swap above; see **Contract v3** under "MQTT-driven
+mode" below).
 
 [stack-chan/m5stack-avatar](https://github.com/stack-chan/m5stack-avatar) used
 to run on a bare ESP-WROOM-32 with a 128x64 SSD1306 I2C OLED — no M5Stack
@@ -61,14 +62,14 @@ bubble" below) — optional, and everything below runs fine without it wired
 up.
 
 By default the board joins WiFi, subscribes to an MQTT topic, and drives the
-avatar + bubble from whatever `{"text":..., "expression":...}` JSON arrives
-(see "MQTT-driven mode" below) — this is meant to run against the `services/api`
-layer in this repo, not standalone. (It previously ran against a Python
-`avatar-brain` service in the homelab; that has been superseded — see the root
-README.)
+avatar + bubble from whatever `{"text":..., "led":..., ...}` JSON arrives
+(see "MQTT-driven mode" below, including **Contract v3**'s removal of
+`"expression"`) — this is meant to run against the `services/api` layer in
+this repo, not standalone. (It previously ran against a Python `avatar-brain`
+service in the homelab; that has been superseded — see the root README.)
 Build with `-DAVATAR_DEMO_MODE` instead to get the old self-cycling bench
-demo (cycles the six built-in expressions, fakes lip-sync babble on every
-third one) with no network required.
+demo (cycles six placeholder phrases, fakes lip-sync babble on every third
+one) with no network required.
 
 Verified live 2026-09-14 on ESP32-D0WDQ6 rev v1.0 (`/dev/cu.usbserial-0001`):
 demo mode renders all six expressions correctly, heap flat at ~295 KB across
@@ -83,13 +84,13 @@ two-line-wrapped bubble.
 This was the reason for building it — the avatar gets one core, the other
 stays free for application work.
 
-| Core | Owner | What runs there |
-|---|---|---|
+| Core          | Owner      | What runs there                                    |
+| ------------- | ---------- | -------------------------------------------------- |
 | 1 (`APP_CPU`) | the avatar | `drawLoop` + `facialLoop` (blink, saccade, breath) |
-| 0 (`PRO_CPU`) | you | `appTask` — triggers, TTS, LLM calls, network |
+| 0 (`PRO_CPU`) | you        | `appTask` — triggers, TTS, LLM calls, network      |
 
 The library already does most of this: `Avatar::start()` hardcodes both of its
-tasks to `APP_CPU_NUM`, so no patching was needed. The part that *is* on us is
+tasks to `APP_CPU_NUM`, so no patching was needed. The part that _is_ on us is
 that Arduino's `loop()` also runs on core 1 — so `loop()` is deliberately left
 empty and all app logic goes in `appTask`, pinned to `PRO_CPU_NUM`. Putting
 work in `loop()` would quietly land it on the avatar's core and fight the
@@ -104,10 +105,10 @@ task only reads.
 
 Two SSD1306 panels, **each on its own I2C bus** — they don't share pins:
 
-| Panel | SDA | SCL | VCC | GND | Bus |
-|---|---|---|---|---|---|
-| Face (`oled`) | GPIO32 | GPIO33 | 3V3 | GND | software (bit-banged) I2C |
-| Bubble (`oledText`) | GPIO4 | GPIO15 | 3V3 | GND | hardware I2C port 1 |
+| Panel               | SDA    | SCL    | VCC | GND | Bus                       |
+| ------------------- | ------ | ------ | --- | --- | ------------------------- |
+| Face (`oled`)       | GPIO32 | GPIO33 | 3V3 | GND | software (bit-banged) I2C |
+| Bubble (`oledText`) | GPIO4  | GPIO15 | 3V3 | GND | hardware I2C port 1       |
 
 Both panels answer at the default address **0x3C** — no jumper needed, since
 they're on physically separate buses and there's nothing to collide with.
@@ -150,12 +151,12 @@ forgiving at high speed.
 A 4-pin RGB LED (3 color legs + 1 common leg), wired straight to the ESP32 —
 no driver board, just a resistor per color leg.
 
-| Leg | GPIO | Resistor |
-|---|---|---|
-| Red | GPIO25 | ~150–220Ω |
-| Green | GPIO26 | ~220–330Ω |
-| Blue | GPIO14 | ~220–330Ω |
-| Common | GND | none |
+| Leg    | GPIO   | Resistor  |
+| ------ | ------ | --------- |
+| Red    | GPIO25 | ~150–220Ω |
+| Green  | GPIO26 | ~220–330Ω |
+| Blue   | GPIO14 | ~220–330Ω |
+| Common | GND    | none      |
 
 **Verified live 2026-09-16** on the same `/dev/cu.usbserial-0001` board:
 wired common-cathode (common leg to GND), all three legs confirmed against
@@ -210,7 +211,7 @@ idle clock. `"cycle"` sweeps the same HSV rainbow as the wiring test above;
 `"blink"` toggles whatever color is active (solid or cycling) on/off every
 400ms. An unrecognized `"led"` string logs a warning and leaves the LED off
 for that message, same "falls back rather than fails" treatment as an
-unrecognized `"expression"`. Not yet verified live against a real message
+unrecognized `"jingle"`. Not yet verified live against a real message
 flow — the wiring test above confirmed the physical LED itself, but this
 message-driven path has only been build-verified so far.
 
@@ -221,11 +222,11 @@ word-wrapped text box to a second panel — `oledText` in `main.cpp` — kept
 completely separate from the avatar's own `M5.Display`. Text is revealed one
 character at a time (`show()`'s `charDelayMs`, default 25ms/char) rather than
 appearing all at once, so it reads as the character actually talking. This
-blocks `appTask` for the reveal's duration (~strlen * charDelayMs) — fine
+blocks `appTask` for the reveal's duration (~strlen \* charDelayMs) — fine
 here since nothing else needs that core's attention mid-phrase, but worth
 knowing if something latency-sensitive ever gets added to the same task.
 `appTask` calls `bubble->show(...)` with a canned phrase alongside each
-expression change; swap that call for real TTS output text and nothing else
+demo-loop pass; swap that call for real TTS output text and nothing else
 needs to change. The canned phrases (`kPhrases` in `main.cpp`) are nihilistic
 one-liners — a demo bubble should at least be funny.
 
@@ -259,13 +260,50 @@ cheap, safe, and it closes the most plausible gap even though the exact
 mechanism wasn't confirmed. Still wants an actual look at the board to
 confirm the report is gone, not just unreproduced in software.
 
+## Screen brightness and overnight schedule
+
+Both OLEDs power off overnight rather than showing an unread idle clock/face
+all night (`MqttLink::applyScreenPower()`), and dim rather than always running
+at full contrast. Three settings, all in `DeviceSettings`/persisted over BLE
+the same way `messageTextSize`/`holdSeconds` are, control this:
+
+| BLE field        | Type              | Meaning                                                                 |
+| ----------------- | ----------------- | ------------------------------------------------------------------------ |
+| `brightness`      | `uint8_t`, 0-100  | Panel contrast, as a percentage (`MqttLink::applyBrightness()` maps this onto the SSD1306 contrast register's 0-255 range). |
+| `screenOffStart`  | `uint16_t`        | Minutes since midnight, local time, when both panels power off.          |
+| `screenOffEnd`    | `uint16_t`        | Minutes since midnight when they power back on. Wraps across midnight when `screenOffStart > screenOffEnd` (e.g. 22:00-07:00); setting the two equal disables the schedule entirely - the panels never power off on their own. Defaults to `0`/`420` (00:00-07:00), matching this feature's original hardcoded window. |
+| `wakeForMessage`  | `bool`            | Whether an incoming message wakes sleeping panels (default `true`, the original behavior). When `false`, a message during the off window is still typed and held as normal, just onto panels that stay powered down - it shows once they next wake on their own. |
+
+Deliberately independent of `isNighttime()`'s fixed 23:00-07:00 window, which
+only controls the resting face's sleepy expression, not panel power - the two
+don't have to (and by default don't) share a boundary.
+
+Changeable from the control page's new Screen settings group
+(`../docs/index.html`) - a brightness slider and two `<input type="time">`
+fields, converted to/from minutes-since-midnight at the BLE read/write
+boundary (see `minutesToTimeStr()`/`timeStrToMinutes()` there).
+
+**Verified live 2026-09-19** on the board (`Ziggy`, `10.0.0.114`,
+`/dev/cu.usbserial-0001`): flashed clean, booted with WiFi/MQTT/BLE all
+connecting normally (no regression from the pre-existing hardcoded
+midnight-07:00/full-brightness/always-wake behavior, since the new settings'
+defaults reproduce it exactly). The BLE config contract itself was exercised
+directly (Python + `bleak`, not the control page) - wrote
+`{"brightness":40,"screenOffStart":1350,"screenOffEnd":375,"wakeForMessage":false}`,
+read the config characteristic back and got those exact values, confirming
+the write persists to NVS and round-trips correctly, then restored the
+defaults. Not yet confirmed by eye: that 40% actually looks dimmer on the
+physical panel, or that the schedule/wake-gating logic behaves correctly
+across a real midnight boundary - both are logic-verified (the mapping math,
+the wraparound comparison) but not eye/clock verified.
+
 ## How it was made to work on a non-M5 panel
 
 Two problems had to be solved; both are worth knowing before editing this.
 
 **1. The avatar only draws to `M5.Display`.** `Face.cpp` references `M5.Lcd` /
 `M5.Display` directly — there is no "render to an arbitrary canvas" entry
-point. So the fix is to make M5Unified's primary display *be* the SSD1306.
+point. So the fix is to make M5Unified's primary display _be_ the SSD1306.
 M5GFX ships `lgfx::Panel_SSD1306` but no device wrapper for it (only
 `M5UnitOLED`, which is an SH110x 64x128), so `include/ssd1306_display.h` is
 that wrapper, written to the same shape as M5GFX's own `M5UnitOLED.h`. It is
@@ -298,7 +336,7 @@ agree.
 
 Build with `-DAVATAR_FB_DUMP` and the panel framebuffer gets dumped to serial
 as ASCII art (`Panel_HasBuffer` keeps a readable RAM copy, so this reads back
-what was actually rasterised, not what was intended) — after each expression
+what was actually rasterised, not what was intended) — after each phrase
 change in demo mode, or once after the synthetic bench-test payload in MQTT
 mode (see "MQTT-driven mode" above). It costs nothing when the flag is off,
 which is the default. This is how every "verified live" claim in this file
@@ -392,7 +430,7 @@ eyeballed as part of this check (no camera on this session) — worth a glance
 next power-up to confirm the split/orientation actually reads as intended,
 given the rotation correction above came from exactly that kind of miss.
 
-**Correction, 2026-09-16: the beep now fires at the *start* of POST, not the
+**Correction, 2026-09-16: the beep now fires at the _start_ of POST, not the
 end.** The paragraph above described a single beep firing "the instant the
 POST side finishes," modeled on the AMI/Award "self-test passed" chime at
 hand-off to the bootloader. On reflection the beep these old boot screens are
@@ -401,7 +439,7 @@ closes it, so `main.cpp`'s boot loop now fires `tone(PIEZO_PIN, 1000, 150)`
 once, immediately after `boot::begin()` and before the loop's first
 `boot::draw(u8g2Top)` call — not when `boot::done()` goes true. `bootDone`/
 `bootDoneAt` still exist and still gate `PHASE_HOLD_MS`; they just no longer
-also gate the beep. Not re-verified live since this only moves *when* an
+also gate the beep. Not re-verified live since this only moves _when_ an
 already-verified `tone()` call fires, not what it does.
 
 **Correction/update, 2026-09-16:** three more changes, made on feedback from
@@ -419,7 +457,7 @@ right to flag.
   6.47s did) it froze on the settled title-card frame instead of falling
   into its own attract loop (kicker lines cycling, scan bar sweeping).
   Both sides now draw every frame unconditionally, and a `POST_HOLD_MS`
-  (2000ms) constant keeps the loop running for a further beat once *both*
+  (2000ms) constant keeps the loop running for a further beat once _both_
   are done, specifically so that attract-loop motion — and POST's cursor
   still blinking — are actually visible before `M5.begin()` takes the
   panels, rather than the app moving on the instant the longer sequence's
@@ -444,7 +482,7 @@ landed "WiFi: connecting..." at 17.89s (up from 14.87-14.88s above by
 almost exactly `POST_HOLD_MS`'s 2000ms, as expected), then through to "MQTT:
 connected and subscribed" / "BLE: advertising" with no crash. Panel pixels
 still weren't eyeballed this round either (still no camera on this
-session) — this entire update exists *because* a human did look at the
+session) — this entire update exists _because_ a human did look at the
 previous round, so that glance is doubly worth doing again here.
 
 **Correction, 2026-09-15: the two physical panels turned out to be mounted
@@ -469,7 +507,7 @@ Three changes, on top of the physical-panel-reversal correction just above:
 - **The shared `while` loop is gone.** `setup()` now runs POST and splash as
   two fully separate phases — POST alone on `u8g2Top` first, then (once
   `boot::done()`) splash alone on `u8g2Bottom` — rather than drawing both to
-  one shared frame clock. This turned out to be why *both* were reported
+  one shared frame clock. This turned out to be why _both_ were reported
   janky, not just the slower panel: sharing one loop meant each sequence's
   own animation was throttled down to whatever pace the loop as a whole
   could sustain, which was however long the slower panel's send took,
@@ -502,7 +540,7 @@ Three changes, on top of the physical-panel-reversal correction just above:
   resolving notes as the mark and kicker land — driven by an explicit stage
   machine (`ThemeStage` in `splash.cpp`) rather than matching beats by time
   window, since `T_MARK` falls inside the slam's own `[T_FLASH,
-  T_FLASH+D_FLASH)` window and a naive time-window match would double-fire
+T_FLASH+D_FLASH)` window and a naive time-window match would double-fire
   the slam beat instead of the mark beat.
 
 **Correction, 2026-09-19:** a report described the screen showing leftover
@@ -512,7 +550,7 @@ any reset that doesn't cut power) rather than a real power cycle. Both
 `sendBuffer()`) right after `begin()`, before either script's first frame -
 previously only `u8g2Bottom` got this, on the reasoning that `boot::draw()`'s
 own per-frame clear would blank `u8g2Top` within its first ~16ms anyway. That
-reasoning covers the *shadow buffer* the two libraries think they're showing,
+reasoning covers the _shadow buffer_ the two libraries think they're showing,
 not the SSD1306's own GDDRAM, which stays powered (and keeps whatever was in
 it) across exactly this kind of reset - there's no way for this code to read
 that back and confirm it's actually clear, hence blanking explicitly rather
@@ -559,7 +597,8 @@ it. The synthwave riff likewise hasn't been listened to yet.
 
 Default build (no flags). `include/mqtt_link.h`'s `MqttLink` owns WiFi +
 MQTT: connects, subscribes to one topic, and on every message parses
-`{"text": "...", "expression": "...", "led": "...", "blink": ..., "jingle": "..."}` JSON and
+`{"text": "...", "led": "...", "blink": ..., "jingle": "..."}` JSON (see
+**Contract v3** below for `"expression"`'s removal from this shape) and
 calls `avatar.setExpression()` + `bubble->show(text)` straight from the
 PubSubClient callback — safe here because that callback already runs inside
 `mqttLink.loop()` on core 0/`appTask`, the same task that owned those calls in
@@ -580,12 +619,12 @@ an easy trap for a publisher to fall into.
 color for as long as this message is on screen. It used to be one of four fixed
 strings; it now accepts:
 
-| Value | Effect |
-|---|---|
-| `""` / omitted | LED stays off |
-| `"#RRGGBB"` (or `RRGGBB`) | any color — this is what the control page's picker sends |
-| `"cycle"` | slow HSV rainbow sweep, as before |
-| `"red"` / `"green"` / `"blue"` | kept as aliases for the full-scale primaries |
+| Value                          | Effect                                                   |
+| ------------------------------ | -------------------------------------------------------- |
+| `""` / omitted                 | LED stays off                                            |
+| `"#RRGGBB"` (or `RRGGBB`)      | any color — this is what the control page's picker sends |
+| `"cycle"`                      | slow HSV rainbow sweep, as before                        |
+| `"red"` / `"green"` / `"blue"` | kept as aliases for the full-scale primaries             |
 
 Matching is case-insensitive. Only the exact 6-digit hex form parses — a short
 `#fff` logs a warning and leaves the LED off, rather than being guessed at.
@@ -594,17 +633,31 @@ Matching is case-insensitive. Only the exact 6-digit hex form parses — a short
 altered — being the one remaining field that cared about case would have been a
 trap rather than a convention.
 
-**Verified live 2026-09-17** on the board (`/dev/cu.usbserial-0001`, device name
+**Contract v3, 2026-09-19 — `"expression"` is gone.** The six-word mood
+vocabulary below (`happy`/`angry`/`sad`/`doubt`/`sleepy`/`neutral`) stopped
+driving anything the moment the portrait pack replaced `m5stack-avatar`'s
+procedural eyes/mouth (see the correction near the top of this file) — it had
+been a parse-and-warn-only no-op field since. `MqttLink` no longer reads the
+key at all: `doc["expression"]` is gone from `parseMessage()`, so a publisher
+that still sends it is unaffected (the key is simply ignored, same as any
+other unrecognized JSON field) but no longer gets the "unrecognized
+expression" warning on the serial log either, since there's nothing left to
+recognize against. Backward compatible in the sense that nothing breaks;
+not backward compatible with anything that was reading that warning as
+signal. `"led"`, `"blink"` and `"jingle"` are unchanged by this.
+
+**Verified live 2026-09-17** (contract v2, when `"expression"` still parsed
+and warned — see the v3 note above for its removal) on the board (`/dev/cu.usbserial-0001`, device name
 `Ziggy`, `10.0.0.114`), by publishing to `avatar/say` and reading the serial log.
 A negative control was included deliberately, so that a silent log means "parsed"
 rather than "nothing was watching":
 
-| Published | Serial output |
-|---|---|
-| `{"expression":"happy","led":"#ff8800","jingle":"Chime"}` | silent — all three v2 forms parse |
-| `{"expression":"Happy","led":"red","jingle":"chime"}` | silent — pre-v2 spellings still work |
-| `{"expression":"sleepy","led":"cycle"}` | silent |
-| `{"expression":"ecstatic","led":"#fff","jingle":"kazoo"}` | all three warned and fell back |
+| Published                                                 | Serial output                        |
+| --------------------------------------------------------- | ------------------------------------ |
+| `{"expression":"happy","led":"#ff8800","jingle":"Chime"}` | silent — all three v2 forms parse    |
+| `{"expression":"Happy","led":"red","jingle":"chime"}`     | silent — pre-v2 spellings still work |
+| `{"expression":"sleepy","led":"cycle"}`                   | silent                               |
+| `{"expression":"ecstatic","led":"#fff","jingle":"kazoo"}` | all three warned and fell back       |
 
 Note the `#fff` case: shorthand hex is **not** accepted, by design. Both the
 typing/LED behaviour on the panels and the color accuracy of a mixed hex value
@@ -623,12 +676,25 @@ four-value enum was the only thing in the way.
 
 `"jingle"` is also optional and picks a short notification tune to play on
 the piezo (`PIEZO_PIN`) right as the message starts showing, before its text
-begins typing — `"chime"`, `"alert"`, `"fanfare"`, `"gentle"`, `"boarding"`, or
-`"beep"`; omit it (or leave it `""`, the default) to play nothing. Each tune runs
+begins typing — `"chime"`, `"alert"`, `"fanfare"`, `"gentle"`, `"boarding"`,
+`"beep"`, `"coin"`, `"oneup"`, `"stageclear"`, `"descend"`, or `"trill"`; omit
+it (or leave it `""`, the default) to play nothing. Each tune runs
 synchronously and finishes in well under a second, so it never overlaps
 `beepChar()`'s own per-character tone() calls on the same pin. An unrecognized
 `"jingle"` string logs a warning and plays nothing, same fallback as
-`"led"`/`"expression"`. See `include/jingle.h` for the note tables.
+`"led"`. See `include/jingle.h` for the note tables.
+
+**`"coin"`/`"oneup"`/`"stageclear"`/`"descend"`/`"trill"` (added 2026-09-19)**
+round out the catalog beyond what any kind currently uses — see
+`services/api/src/triage.ts`'s `BY_KIND` for what's actually wired up today.
+`coin`, `oneup` and `stageclear` are Mario Bros SFX transcribed by ear (not
+from a reference), close enough to read as "that game" on a piezo buzzer.
+`descend` mirrors `gentle`'s soft rise as a soft fall, for a "resolved/cleared"
+occasion; `trill` is a busier two-note alternation for "worth a second look."
+None of the five are wired to a kind yet — built and flashed to confirm they
+compile and play, not chosen for anything. Not yet verified live via MQTT
+(no `avatar/say` publish/serial-log round trip done for these five, unlike
+the `boarding`/`beep` tables above).
 
 **`"boarding"` (added 2026-09-18)** is a discreet two-tone "bing-bong" played
 twice — the shape of a real airport PA chime, short and unhurried rather than
@@ -640,10 +706,10 @@ practice it plays for every aircraft arrival and departure.
 `Ziggy`, `10.0.0.114`), same method as the 2026-09-17 table: publish to
 `avatar/say`, read the serial log, negative control included.
 
-| Published | Serial output |
-|---|---|
-| `{"jingle":"boarding",...}` | silent — parsed, tune plays |
-| `{"jingle":"kazoo",...}` | warned and fell back, same as before |
+| Published                   | Serial output                        |
+| --------------------------- | ------------------------------------ |
+| `{"jingle":"boarding",...}` | silent — parsed, tune plays          |
+| `{"jingle":"kazoo",...}`    | warned and fell back, same as before |
 
 This confirms parsing and that a tune plays, not what it sounds like through
 the piezo — nobody listened to the board for this check, so "discreet
@@ -667,9 +733,9 @@ was removed instead of special-cased.
 method as the 2026-09-17/18 tables: publish to `avatar/say`, read the serial
 log, negative control included.
 
-| Published | Serial output |
-|---|---|
-| `{"led":"#00ff00","jingle":"beep",...}` | silent — parsed, tune plays |
+| Published                               | Serial output                        |
+| --------------------------------------- | ------------------------------------ |
+| `{"led":"#00ff00","jingle":"beep",...}` | silent — parsed, tune plays          |
 | `{"led":"#00ff00","jingle":"boop",...}` | warned and fell back, same as before |
 
 Same caveat as the other tables: this confirms parsing, not what the beep
@@ -679,11 +745,9 @@ the board for this check.
 
 Config lives in `include/secrets.h` (gitignored — copy `secrets.h.example`
 and fill in `WIFI_SSID`/`WIFI_PASS`/`MQTT_HOST`/`MQTT_PORT`/`MQTT_TOPIC`).
-Expression strings match `kExpressionNames[]` in `main.cpp` case-insensitively
-(see contract v2 above) — an unrecognized string falls back to `Neutral` and
-logs a warning rather than failing silently.
 
 A few sharp edges worth knowing if this stops working:
+
 - **PubSubClient's default 256-byte buffer silently drops anything larger** —
   no error, nothing in the callback, the message just never arrives.
   `mqtt_link.h` calls `setBufferSize(512)` explicitly; if messages start
@@ -742,14 +806,14 @@ A few sharp edges worth knowing if this stops working:
   next reconnect, same as any other BLE-written setting (`reconfigure()`
   forces one). The BLE name is different: `BleConfigService::renameDevice()`
   re-advertises under the new name live, without a reboot — `NimBLEDevice::
-  setDeviceName()` plus `NimBLEAdvertising::setName()` + a stop/start cycle,
+setDeviceName()` plus `NimBLEAdvertising::setName()` + a stop/start cycle,
   called from `onConfig_`'s own NimBLE host-task thread since (unlike
   WiFi/MQTT) none of that touches lwIP.
 - **The bubble panel no longer goes blank while booting.** `appTask` types
   "Connecting to `<ssid>`" on the bubble right before the blocking
-  WiFi connect, then "Fetching data" once that attempt has settled and
+  WiFi connect, then "Fetching" once that attempt has settled and
   MQTT/SNTP take over. `DigitalClock::draw()`'s unsynced branch (in
-  `digital_clock.h`) picks up that same "Fetching data" text once
+  `digital_clock.h`) picks up that same "Fetching" text once
   `idleClock` starts ticking, so the panel stays on message instead of
   blanking for however long SNTP/MQTT actually take. **Correction,
   2026-09-16:** an earlier version of this file said the
@@ -769,7 +833,7 @@ longer exists.** It said `SpeechBubble::wrapLines()` doesn't cap vertical line
 count, so "text too long for the 64px panel just wraps past the bottom edge and
 isn't visible", and concluded that publishers should keep messages well under
 ~50 characters. That was true when written, and stayed believable because the
-50-character advice is good for *readability* either way.
+50-character advice is good for _readability_ either way.
 
 What actually happens now: `show()` sets a scroll rect over the content area and
 calls `scroll(0, -lineHeight)` once lines exceed `maxLines`, so long text scrolls
@@ -777,6 +841,7 @@ up a row at a time as it types rather than disappearing off the bottom. Nothing
 is lost to the panel edge.
 
 The real costs of long text are different, and both are timing:
+
 - It reveals at ~45ms/char, so a 200-character message takes ~9s to type, during
   which `mqtt_.loop()` is not being serviced.
 - Lines that have scrolled off cannot be re-read — the message has to be read as

@@ -88,6 +88,14 @@ research had already been done; the flights feed was simply what got built
 first. The HA work is still queued and still valid — see
 [`services/README.md`](services/README.md).
 
+**Correction, 2026-09-19:** contract v3 removed `expression` entirely — the
+`happy`/`angry`/`sad`/`doubt`/`sleepy`/`neutral` vocabulary above and the
+`{"expression":"happy",...}` triage output a few lines up are v2 history, not
+current behavior. The field had already stopped doing anything the moment the
+firmware's portrait pack replaced m5avatar's procedural eyes/mouth (contract
+v2's expressions had nowhere left to apply); v3 just stopped sending and
+validating it. `led`, `blink` and `jingle` are unaffected.
+
 `feeds/example` remains a template, left disabled behind a compose profile.
 
 ## Deploy

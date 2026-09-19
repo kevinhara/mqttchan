@@ -97,18 +97,36 @@ class PortraitFace {
   // MqttLink calls this from revertToIdle(), once an announcement (typing +
   // hold, or a dismiss mid-typing) is fully done.
   void pickRandom() {
-    if (portraits::kPortraitCount > 1) {
-      size_t next;
-      do {
-        next = static_cast<size_t>(random(0, (long)portraits::kPortraitCount));
-      } while (next == index_);
-      index_ = next;
+    if (portraits::kPortraitCount <= 1) {
+      frame_ = 0;
+      lastOffset_ = kNoOffset;
+      blinking_ = false;
+      scheduleNextBlink(millis());
+      drawFrame(0, 0);
+      return;
     }
+    size_t next;
+    do {
+      next = static_cast<size_t>(random(0, (long)portraits::kPortraitCount));
+    } while (next == index_);
+
+    // Cross-fade to the new character via the panel's contrast register
+    // (display_->setBrightness() - see ssd1306_display.h) rather than a hard
+    // cut: fade the outgoing one to black, swap the bitmap while the panel's
+    // dark, then fade the new one back in. fadeBrightness() blocks appTask
+    // for kFadeStepMs*kFadeSteps each way (~2s total), same as
+    // SpeechBubble::holdWithCountdown() already blocks it for the countdown
+    // bar.
+    uint8_t restBrightness = display_->getBrightness();
+    fadeBrightness(restBrightness, 0);
+    index_ = next;
     frame_ = 0;
     lastOffset_ = kNoOffset;
     blinking_ = false;
-    scheduleNextBlink(millis());
     drawFrame(0, 0);
+    fadeBrightness(0, restBrightness);
+
+    scheduleNextBlink(millis());
   }
 
   // Replaces the old Sleepy/Neutral m5avatar expression toggle
@@ -143,6 +161,12 @@ class PortraitFace {
   static constexpr uint32_t kBlinkIntervalMinMs = 2500;
   static constexpr uint32_t kBlinkIntervalJitterMs = 3000;
 
+  // pickRandom()'s cross-fade: kFadeSteps brightness steps at kFadeStepMs
+  // apart, run twice (out, then back in) - 40 * 25ms = 1000ms per leg, 2s
+  // total for the swap.
+  static constexpr uint32_t kFadeStepMs = 25;
+  static constexpr int kFadeSteps = 40;
+
   // Picks the next blink at a randomized interval from nowMs - called
   // whenever idle sway resumes (stopTalking(), pickRandom(), waking from
   // setSleeping(true), and the ctor via pickRandom()) and again right after
@@ -170,6 +194,21 @@ class PortraitFace {
   // whichever one advanceTalkFrame() is currently on.
   void drawFrame(uint8_t frameIndex, int yOffset) {
     draw(portraits::kPortraits[index_].frames[frameIndex], yOffset);
+  }
+
+  // Steps display_'s contrast register (display_->setBrightness() - see
+  // ssd1306_display.h's Panel_SSD1306 wrapper) linearly from `from` to `to`,
+  // kFadeSteps at a time. Called twice by pickRandom(), once each direction
+  // around the actual bitmap swap; blocks the caller (appTask) for its
+  // duration, same as SpeechBubble::holdWithCountdown() already does for the
+  // countdown bar.
+  void fadeBrightness(uint8_t from, uint8_t to) {
+    if (from == to) return;
+    for (int step = 1; step <= kFadeSteps; step++) {
+      int value = from + (static_cast<int>(to) - from) * step / kFadeSteps;
+      display_->setBrightness(static_cast<uint8_t>(value));
+      vTaskDelay(pdMS_TO_TICKS(kFadeStepMs));
+    }
   }
 
   void draw(const uint8_t *bitmap, int yOffset) {

@@ -3,9 +3,9 @@
  * ADS-B. Configured for ZQN (Queenstown, NZQN) by default; the airport is
  * entirely env-driven, so pointing it somewhere else is three variables.
  *
- * As with every feed, this says only *what happened*. It picks no expression,
- * no colour and no jingle, and never touches MQTT - `kind: "notice"` is the
- * whole of its opinion, and the API's triage turns that into a face.
+ * As with every feed, this says only *what happened*. It picks no colour and
+ * no jingle, and never touches MQTT - `kind: "notice"` is the whole of its
+ * opinion, and the API's triage turns that into a face.
  *
  * See what it can see right now, without sending anything:
  *   node dist/index.js --once --dry-run

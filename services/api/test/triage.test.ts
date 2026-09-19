@@ -6,7 +6,6 @@ describe("triage", () => {
     const p = presentationFor("ambient", "low");
     expect(p.jingle).toBe("");
     expect(p.led).toBe("");
-    expect(p.expression).toBe("neutral");
   });
 
   it("gives a sensor reading a quiet beep and a green LED", () => {
@@ -18,7 +17,7 @@ describe("triage", () => {
 
   it("falls back for an unknown kind instead of throwing", () => {
     const p = presentationFor("something.nobody.defined", "normal");
-    expect(p.expression).toBe("neutral");
+    expect(p.led).toBe("");
     expect(p.jingle).toBe("");
   });
 
@@ -36,12 +35,5 @@ describe("triage", () => {
 
   it("leaves a kind's own jingle alone at low priority", () => {
     expect(presentationFor("alert", "low").jingle).toBe("alert");
-  });
-
-  it("emits only lowercase expressions", () => {
-    for (const kind of ["ambient", "notice", "alert", "celebrate"]) {
-      const p = presentationFor(kind, "normal");
-      expect(p.expression).toBe(p.expression.toLowerCase());
-    }
   });
 });

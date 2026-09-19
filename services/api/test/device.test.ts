@@ -4,7 +4,6 @@ import type { DevicePayload } from "../src/device.js";
 
 const base: DevicePayload = {
   text: "hello",
-  expression: "neutral",
   led: "",
   blink: false,
   jingle: "",
@@ -30,11 +29,6 @@ describe("led validation", () => {
 describe("finalisePayload", () => {
   it("refuses empty text, which the device would silently ignore", () => {
     expect(() => finalisePayload({ ...base, text: "   " }, 512)).toThrow(PayloadError);
-  });
-
-  it("rejects an invalid expression rather than letting the device fall back", () => {
-    const bad = { ...base, expression: "Happy" as never };
-    expect(() => finalisePayload(bad, 512)).toThrow(PayloadError);
   });
 
   it("passes a payload that already fits through untouched", () => {

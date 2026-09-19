@@ -91,14 +91,28 @@ class DigitalClock {
   // dead-centre for as long as the device stays powered on. Kept tight on X:
   // "HH:MM" at size 4 is 120px wide on a 128px panel (see the size-4 comment
   // below), leaving only 4px of slack per side, so a ±3 swing is as far as
-  // it can move without clipping. Y has far more room — size-4 text is 32px
-  // tall on a 64px panel, 16px slack per side — so it does most of the work.
+  // it can move without clipping. Y used to swing ±10 when this clock was the
+  // only thing on the panel; capped at ±6 since the date line below now
+  // shares the same vertical budget (32px time + 2px gap + 8px date = 42px
+  // against a 64px panel, i.e. 11px slack per side at dy=0) and a ±10 swing
+  // would clip the date off the bottom edge.
   static constexpr int8_t kOffsets[][2] = {
-      {0, 0},  {3, -10}, {-3, 10}, {3, 10}, {-3, -10},
-      {0, -10}, {0, 10}, {3, 0},  {-3, 0},
+      {0, 0},  {3, -6}, {-3, 6}, {3, 6}, {-3, -6},
+      {0, -6}, {0, 6}, {3, 0},  {-3, 0},
   };
   static constexpr size_t kOffsetCount =
       sizeof(kOffsets) / sizeof(kOffsets[0]);
+
+  // Shortened weekday/month names for the date line under the clock, e.g.
+  // "SAT 20 SEPT" — NZ-style abbreviations (three letters, except SEPT),
+  // not strftime's %a/%b (which give "Sat"/"Sep").
+  static constexpr const char *kWeekdayAbbrev[7] = {
+      "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT",
+  };
+  static constexpr const char *kMonthAbbrev[12] = {
+      "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+      "JUL", "AUG", "SEPT", "OCT", "NOV", "DEC",
+  };
 
   void draw(time_t now) {
     struct tm local;
@@ -112,7 +126,7 @@ class DigitalClock {
       // Correction, 2026-09-16: this used to fall back to a "--:--"
       // placeholder while unsynced (see git history), which read as a
       // stuck/broken clock rather than a device still booting. Then changed
-      // to a blank screen, then to redrawing "Fetching data" itself here so
+      // to a blank screen, then to redrawing "Fetching" itself here so
       // the panel never goes blank for the rest of a long unsynced wait
       // (MQTT retries, a slow broker, NTP taking its time). That redraw was
       // its own bug: main.cpp's appTask already types that same "Fetching
@@ -153,6 +167,19 @@ class DigitalClock {
     display_->setTextDatum(textdatum_t::middle_center);
     display_->drawString(buf, display_->width() / 2 + dx,
                           display_->height() / 2 + dy);
+
+    // Shortened date, e.g. "SAT 20 SEPT", centered under the clock in a
+    // small font. Anchored off the time's own center+dy rather than a fixed
+    // Y so it tracks the burn-in swing above instead of drifting apart from
+    // it or overlapping it.
+    char dateBuf[16];
+    snprintf(dateBuf, sizeof(dateBuf), "%s %d %s",
+              kWeekdayAbbrev[local.tm_wday], local.tm_mday,
+              kMonthAbbrev[local.tm_mon]);
+    display_->setTextSize(1);
+    display_->setTextDatum(textdatum_t::top_center);
+    display_->drawString(dateBuf, display_->width() / 2 + dx,
+                          display_->height() / 2 + dy + 18);
     display_->endWrite();
   }
 

@@ -1,0 +1,13 @@
+{
+  "name": "@mqttchan/feed-sky",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "dependencies": {
+    "@mqttchan/contract": "*",
+    "@mqttchan/feed-kit": "*",
+    "astronomy-engine": "^2.1.19",
+    "fast-xml-parser": "^5.11.1"
+  }
+}

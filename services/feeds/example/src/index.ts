@@ -3,7 +3,7 @@
  *
  * It exists to prove the whole path - feed -> API -> broker -> device - and to
  * be the thing you copy when writing a real one. Note what it does *not* do:
- * no MQTT client, no payload shape, no expression or color. It reports what
+ * no MQTT client, no payload shape, no color or jingle. It reports what
  * happened and lets the API decide how that looks.
  *
  * Run one tick and print without sending:
