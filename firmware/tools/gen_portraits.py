@@ -27,18 +27,29 @@ recovered automatically and then spot-checked by eye:
 (not just re-embed _GROUPS by hand) if the pack is ever replaced - the
 threshold was tuned against this specific pack's dither pattern.
 
-Two characters (index 44 and 66 below - portraits 112 and 156) ship only one
-frame each, i.e. no second frame for PortraitFace's idle blink to flash to.
-Rather than exclude them from blinking, _SYNTHETIC_BLINKS below synthesizes
-one: for each character, one or more (x0, y0, x1, y1) boxes hand-picked by
-eye (pun noted) against that character's own art - see the box-finding
-crops this was done with, not kept in the repo, but reproducible by cropping
-+ upscaling the source PNG around the eye and reading pixel coordinates off
-a grid overlay. make_blink() below fills each box solid (closing the eye)
-and cuts a thin light line back through its vertical middle (an eyelid
-crease) - the same flat "line on an otherwise dark shape" convention this
-pack already uses elsewhere. Added 2026-09-19 after a first pass gave these
-two a head-nod instead of a blink, which wasn't what was asked for.
+Every character also gets a synthesized "blink" frame, kept in the Portrait
+struct's own `blink` field - separate from `frames`/`frameCount`, which stay
+exactly what the pack shipped and exist for MqttLink's talk-time lip-sync
+(see advanceTalkFrame() in portrait_face.h). _SYNTHETIC_BLINKS below is one
+or more (x0, y0, x1, y1) eye boxes per character, in source-image (64x64)
+coordinates, hand-picked by eye (pun noted) against that character's own
+frame-0 art - see the grid-overlay contact sheets this was done with, not
+kept in the repo but reproducible from any image tool. make_blink() fills
+each box solid (closing the eye) and cuts a thin light line back through its
+vertical middle (an eyelid crease) - the same flat "line on an otherwise
+dark shape" convention this pack already uses elsewhere for half-closed/
+squinting eyes. "Eye" is loose for the handful of non-human designs in the
+pack (robots, skulls, a helmet) - whatever reads as the character's own
+eye-like feature (camera lens, socket, vent) gets the same treatment, for a
+consistent mechanic across all 99 rather than an exception list.
+
+Correction, 2026-09-19: an earlier pass reused each character's own frame 1
+as the blink instead of synthesizing one, on the theory that it was "usually
+a mouth-flap frame doing double duty" and close enough. Wrong on a live
+board: frame 1 is the talk-cycle's mouth-open frame for a large fraction of
+characters, so "blinking" was visibly opening its mouth instead. Frame
+1/2/3 are for advanceTalkFrame() only now; the blink is always this
+synthesized frame, for every character, not reused pack art.
 """
 import pathlib
 
@@ -52,13 +63,121 @@ OUT_PATH = SCRIPT_DIR.parent / "include" / "portraits_data.h"
 W = H = 64
 ROW_BYTES = (W + 7) // 8  # 8, since W is byte-aligned
 
+def _eb(cx, cy, half_w=5, half_h=4):
+    """An eye box centered on (cx, cy) - most entries below just need a
+    center point; the handful with an explicit 4-tuple instead are wider
+    features (glasses, goggles, a visor) that needed a bigger or
+    differently-shaped box than the default 10x8."""
+    return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+
 # Character index (position in _GROUPS below) -> eye box(es) in source-image
 # (64x64) coordinates, (x0, y0, x1, y1), half-open like a Python slice. See
-# the module docstring.
+# the module docstring. One box = a single visible eye (profile portraits, a
+# cyclops design, a face partly hidden by hair) or one wide feature covering
+# both (goggles); otherwise two, left eye first.
 _SYNTHETIC_BLINKS = {
+    0: [_eb(22, 24), _eb(38, 24)],
+    1: [_eb(23, 30), _eb(39, 30)],
+    2: [_eb(22, 33), _eb(41, 33)],
+    3: [_eb(24, 22, 7, 6), _eb(40, 22, 7, 6)],
+    4: [_eb(25, 33), _eb(39, 33)],
+    5: [_eb(23, 31), _eb(39, 31)],
+    6: [_eb(23, 29), _eb(40, 29)],
+    7: [_eb(23, 27, 6, 5), _eb(39, 27, 6, 5)],
+    8: [_eb(21, 29), _eb(37, 29)],
+    9: [_eb(21, 29), _eb(38, 29)],
+    10: [_eb(23, 31), _eb(40, 31)],
+    11: [_eb(23, 29), _eb(40, 29)],
+    12: [_eb(21, 31), _eb(38, 31)],
+    13: [_eb(23, 31), _eb(40, 31)],
+    14: [_eb(23, 29), _eb(39, 29)],
+    15: [_eb(23, 31), _eb(39, 31)],
+    16: [_eb(20, 28), _eb(37, 28)],
+    17: [_eb(23, 20), _eb(42, 20)],
+    18: [_eb(23, 27), _eb(39, 27)],
+    19: [_eb(25, 31), _eb(41, 31)],
+    20: [_eb(25, 31), _eb(41, 31)],
+    21: [_eb(22, 27), _eb(40, 27)],
+    22: [_eb(23, 29), _eb(39, 29)],
+    23: [_eb(25, 31), _eb(41, 31)],
+    24: [_eb(23, 29, 6, 6), _eb(39, 29, 6, 6)],
+    25: [_eb(23, 27), _eb(39, 27)],
+    26: [_eb(23, 27, 6, 6), _eb(41, 27, 6, 6)],
+    27: [_eb(42, 32)],
+    28: [_eb(23, 29), _eb(39, 29)],
+    29: [_eb(25, 31), _eb(41, 31)],
+    30: [_eb(24, 27), _eb(40, 27)],
+    31: [_eb(22, 27), _eb(40, 27)],
+    32: [_eb(20, 31), _eb(38, 31)],
+    33: [_eb(21, 28, 6, 6), _eb(39, 28, 6, 6)],
+    34: [_eb(26, 31), _eb(40, 31)],
+    35: [_eb(25, 29), _eb(41, 29)],
+    36: [_eb(23, 29), _eb(40, 29)],
+    37: [_eb(23, 29), _eb(40, 29)],
+    38: [_eb(23, 27), _eb(39, 27)],
+    39: [_eb(22, 31), _eb(38, 31)],
+    40: [_eb(22, 31), _eb(38, 31)],
+    41: [_eb(22, 30, 6, 6), _eb(40, 30, 6, 6)],
+    42: [_eb(25, 31), _eb(41, 31)],
+    43: [_eb(24, 29), _eb(44, 29)],
     44: [(16, 21, 29, 37), (35, 21, 48, 37)],  # portrait 112, two eyes
+    45: [_eb(22, 31), _eb(40, 31)],
+    46: [_eb(23, 29), _eb(39, 29)],
+    47: [_eb(32, 33), _eb(52, 33)],
+    48: [_eb(22, 27), _eb(40, 27)],
+    49: [_eb(22, 29), _eb(40, 29)],
+    50: [_eb(22, 31), _eb(40, 31)],
+    51: [_eb(24, 27), _eb(42, 27)],
+    52: [_eb(35, 28, 17, 5)],
+    53: [_eb(22, 27), _eb(38, 27)],
+    54: [_eb(23, 31), _eb(41, 31)],
+    55: [_eb(25, 31), _eb(41, 31)],
+    56: [_eb(22, 29), _eb(40, 29)],
+    57: [_eb(36, 31)],
+    58: [_eb(24, 29), _eb(42, 29)],
+    59: [_eb(22, 29), _eb(40, 29)],
+    60: [_eb(25, 23), _eb(45, 23)],
+    61: [_eb(17, 33), _eb(39, 33)],
+    62: [_eb(28, 30), _eb(46, 30)],
+    63: [_eb(29, 29), _eb(47, 29)],
+    64: [_eb(24, 27), _eb(40, 27)],
+    65: [_eb(20, 25, 7, 5), _eb(38, 25, 7, 5)],
     66: [(9, 31, 16, 39)],  # portrait 156, one eye (3/4 profile)
+    67: [_eb(34, 32, 4, 3), _eb(50, 32, 4, 3)],
+    68: [_eb(27, 31, 5, 4), _eb(45, 31, 5, 4)],
+    69: [_eb(46, 37)],
+    70: [_eb(28, 27), _eb(42, 27)],
+    71: [_eb(23, 28, 7, 6), _eb(47, 28, 7, 6)],
+    72: [_eb(21, 20, 7, 6), _eb(47, 20, 7, 6)],
+    73: [_eb(23, 32, 7, 6), _eb(41, 32, 7, 6)],
+    74: [_eb(21, 18, 7, 6), _eb(45, 18, 7, 6)],
+    75: [_eb(40, 22, 12, 10)],  # cyclops - a single big centered eye
+    76: [_eb(23, 26), _eb(41, 26)],
+    77: [_eb(20, 28), _eb(40, 28)],
+    78: [_eb(20, 25), _eb(40, 25)],
+    79: [_eb(28, 29), _eb(48, 29)],
+    80: [_eb(26, 27), _eb(46, 27)],
+    81: [_eb(24, 27), _eb(44, 27)],
+    82: [_eb(28, 27), _eb(48, 27)],
+    83: [_eb(28, 27), _eb(48, 27)],
+    84: [_eb(24, 24), _eb(42, 24)],
+    85: [_eb(32, 18), _eb(46, 18)],
+    86: [_eb(31, 31), _eb(46, 31)],
+    87: [_eb(20, 17), _eb(44, 16)],
+    88: [_eb(21, 28), _eb(41, 28)],
+    89: [_eb(45, 26, 9, 8)],  # a screen digit, not a face - one wide box
+    90: [_eb(42, 16), _eb(52, 16)],
+    91: [_eb(32, 20), _eb(44, 20)],
+    92: [_eb(18, 25), _eb(34, 25)],
+    93: [_eb(31, 25), _eb(43, 25)],
+    94: [_eb(25, 32), _eb(45, 32)],
+    95: [_eb(40, 19), _eb(50, 19)],
+    96: [_eb(29, 24), _eb(47, 24)],
+    97: [_eb(38, 16), _eb(50, 16)],
+    98: [_eb(20, 22, 5, 5)],  # a helmet vent, the closest thing to an eye
 }
+assert len(_SYNTHETIC_BLINKS) == 99
 
 
 def make_blink(im, boxes, line_height=2):
@@ -138,8 +257,8 @@ def main():
 // portraits" pack (assets/1-bit dialogue portraits/x2 64x64px/*.png at the
 // repo root; see that folder's license.txt for terms). Do not hand-edit -
 // re-run the generator (see its module docstring for how the frame
-// grouping below was derived) if the source pack changes. A couple of
-// frames (marked below) are synthetic, not from the pack - see
+// grouping below was derived) if the source pack changes. Every
+// character's `blink` field is synthetic, not from the pack - see
 // _SYNTHETIC_BLINKS in the generator.
 #pragma once
 
@@ -154,36 +273,31 @@ constexpr int kHeight = 64;
 '''
     lines = [header]
 
-    synthetic_frames = 0
     char_frame_vars = []
+    blink_vars = []
     for ci, group in enumerate(_GROUPS):
         frame_vars = []
-        last_im = None
+        frame0_im = None
         for fi, portrait_num in enumerate(group):
-            last_im = load_gray(portrait_num)
-            bits = pack_bits(last_im)
+            im = load_gray(portrait_num)
+            if fi == 0:
+                frame0_im = im
+            bits = pack_bits(im)
             varname = f"kFrame_{ci}_{fi}"
             hexes = ", ".join(f"0x{b:02x}" for b in bits)
             lines.append(f"static const uint8_t {varname}[] = {{{hexes}}};\n")
             frame_vars.append(varname)
-
-        boxes = _SYNTHETIC_BLINKS.get(ci)
-        if boxes is not None:
-            assert len(group) == 1, (
-                f"character {ci} has a synthetic blink box but already has "
-                f"{len(group)} real frames - drop it from _SYNTHETIC_BLINKS"
-            )
-            bits = pack_bits(make_blink(last_im, boxes))
-            varname = f"kFrame_{ci}_{len(frame_vars)}"
-            hexes = ", ".join(f"0x{b:02x}" for b in bits)
-            lines.append(
-                f"static const uint8_t {varname}[] = {{{hexes}}};  "
-                f"// synthetic blink, see _SYNTHETIC_BLINKS\n"
-            )
-            frame_vars.append(varname)
-            synthetic_frames += 1
-
         char_frame_vars.append(frame_vars)
+
+        boxes = _SYNTHETIC_BLINKS[ci]
+        bits = pack_bits(make_blink(frame0_im, boxes))
+        varname = f"kBlink_{ci}"
+        hexes = ", ".join(f"0x{b:02x}" for b in bits)
+        lines.append(
+            f"static const uint8_t {varname}[] = {{{hexes}}};  "
+            f"// synthetic, see _SYNTHETIC_BLINKS - not a talk-cycle frame\n"
+        )
+        blink_vars.append(varname)
     lines.append("\n")
 
     for ci, frame_vars in enumerate(char_frame_vars):
@@ -192,12 +306,15 @@ constexpr int kHeight = 64;
     lines.append("\n")
 
     lines.append("struct Portrait {\n")
-    lines.append("  const uint8_t *const *frames;\n")
+    lines.append("  const uint8_t *const *frames;  // talk-cycle, see advanceTalkFrame()\n")
     lines.append("  uint8_t frameCount;\n")
+    lines.append("  const uint8_t *blink;  // idle-only, see startBlink() - never talk-cycled\n")
     lines.append("};\n\n")
     lines.append("static const Portrait kPortraits[] = {\n")
     for ci, frame_vars in enumerate(char_frame_vars):
-        lines.append(f"    {{kChar_{ci}_frames, {len(frame_vars)}}},\n")
+        lines.append(
+            f"    {{kChar_{ci}_frames, {len(frame_vars)}, {blink_vars[ci]}}},\n"
+        )
     lines.append("};\n\n")
     lines.append(
         "constexpr size_t kPortraitCount = sizeof(kPortraits) / sizeof(kPortraits[0]);\n\n"
@@ -208,8 +325,8 @@ constexpr int kHeight = 64;
     print(f"wrote {OUT_PATH}")
     print(
         f"characters: {len(_GROUPS)}, "
-        f"total frames: {sum(len(g) for g in _GROUPS) + synthetic_frames} "
-        f"({synthetic_frames} synthetic)"
+        f"talk-cycle frames: {sum(len(g) for g in _GROUPS)}, "
+        f"blink frames: {len(blink_vars)} (all synthetic)"
     )
 
 

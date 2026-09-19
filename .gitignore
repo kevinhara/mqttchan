@@ -12,6 +12,10 @@ firmware/.dummy/
 firmware/managed_components/
 firmware/sdkconfig.defaults
 firmware/sdkconfig.esp32dev
+# firmware/tools/gen_portraits.py is a plain script, run directly rather
+# than imported - but this appears the moment anything (even a one-off
+# analysis script) imports it instead.
+firmware/tools/__pycache__/
 
 # --- services ---
 node_modules/
